@@ -1,0 +1,31 @@
+[tools]
+rust = "1.99.1"
+zig = "0.15.2"
+
+[tasks.check]
+description = "Check formatting and compile all targets"
+run = ["cargo fmt --all -- --check", "cargo check --locked --all-targets"]
+
+[tasks.verify]
+description = "Run formatting, compilation, strict Clippy, tests and Ghostty smoke checks"
+run = ["mise run check", "mise run lint", "mise run test"]
+
+[tasks."test:core"]
+description = "Run pure state and rendering-data tests without dependency downloads"
+run = "bash scripts/test-core.sh"
+
+[tasks.test]
+description = "Run all unit tests and the Ghostty integration smoke executable"
+run = ["cargo test --locked --all-targets", "cargo run --locked --no-default-features --features ghostty --bin ghostty-smoke"]
+
+[tasks.lint]
+description = "Run Clippy across the application"
+run = "cargo clippy --locked --all-targets --all-features -- -D warnings"
+
+[tasks.smoke]
+description = "Exercise Ghostty without a graphics session"
+run = "cargo run --locked --no-default-features --features ghostty --bin ghostty-smoke"
+
+[tasks.dev]
+description = "Open the GPUI workspace shell"
+run = "cargo run --locked --bin rex-rs"

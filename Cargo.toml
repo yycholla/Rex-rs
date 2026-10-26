@@ -1,0 +1,45 @@
+[package]
+name = "rex-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+default-run = "rex-rs"
+
+[dependencies]
+anyhow = { version = "1", optional = true }
+gpui = { version = "=0.2.2", optional = true }
+libghostty-vt = { version = "=0.2.1", optional = true }
+
+[features]
+default = ["desktop"]
+ghostty = ["dep:anyhow", "dep:libghostty-vt"]
+desktop = ["ghostty", "dep:gpui"]
+
+[[bin]]
+name = "rex-rs"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "ghostty-smoke"
+path = "src/bin/ghostty-smoke.rs"
+required-features = ["ghostty"]
+
+[lints.rust]
+unsafe_code = "forbid"
+unknown_lints = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+cast_possible_truncation = "allow"
+
+unwrap_used = "warn"
+expect_used = "warn"
+
+todo = "warn"
+panic = "warn"
+dbg_macro = "warn"
+unimplemented = "warn"
