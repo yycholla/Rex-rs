@@ -18,6 +18,7 @@ macro_rules! identity {
     };
 }
 identity!(SessionId);
+identity!(WindowId);
 identity!(PaneId);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,7 +58,6 @@ impl Layout {
     }
 
     #[must_use]
-
     pub fn contains(&self, pane: PaneId) -> bool {
         match self {
             Self::Pane(id) => *id == pane,
@@ -102,16 +102,16 @@ impl Layout {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Session {
-    id: SessionId,
+pub struct WorkspaceWindow {
+    id: WindowId,
     title: String,
     layout: Layout,
     active_pane: PaneId,
 }
 
-impl Session {
+impl WorkspaceWindow {
     #[must_use]
-    pub const fn id(&self) -> SessionId {
+    pub const fn id(&self) -> WindowId {
         self.id
     }
     #[must_use]
@@ -128,6 +128,41 @@ impl Session {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Session {
+    id: SessionId,
+    title: String,
+    windows: Vec<WorkspaceWindow>,
+    active_window: usize,
+}
+
+impl Session {
+    #[must_use]
+    pub const fn id(&self) -> SessionId {
+        self.id
+    }
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+    #[must_use]
+    pub fn windows(&self) -> &[WorkspaceWindow] {
+        &self.windows
+    }
+    #[must_use]
+    pub fn active_window(&self) -> &WorkspaceWindow {
+        &self.windows[self.active_window]
+    }
+    #[must_use]
+    pub fn layout(&self) -> &Layout {
+        self.active_window().layout()
+    }
+    #[must_use]
+    pub fn active_pane(&self) -> PaneId {
+        self.active_window().active_pane()
+    }
+}
+
 /// Commands are the one mutation boundary shared by buttons and key bindings.
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -135,6 +170,12 @@ pub enum Command {
     SelectSession(SessionId),
     RenameSession { session: SessionId, title: String },
     CloseSession(SessionId),
+    CreateWindow { session: SessionId, title: String },
+    SelectWindow(WindowId),
+    RenameWindow { window: WindowId, title: String },
+    CloseWindow(WindowId),
+    NextWindow,
+    PreviousWindow,
     SplitPane { pane: PaneId, axis: SplitAxis },
     FocusPane(PaneId),
     ClosePane(PaneId),
@@ -162,40 +203,19 @@ impl Workspace {
     pub fn pane_ids(&self) -> Vec<PaneId> {
         self.sessions
             .iter()
-            .flat_map(|session| session.layout.panes())
+            .flat_map(|session| session.windows.iter())
+            .flat_map(|window| window.layout.panes())
             .collect()
     }
 
-    /// Apply a workspace command while preserving session and pane invariants.
+    /// Apply a command without rebuilding terminals or reusing identities.
     ///
     /// # Errors
-    /// Returns an error for stale session/pane IDs, empty titles, operations
-    /// requiring an active session when none exists, or exhausted identity space.
-    /// Failed validation leaves the workspace unchanged.
+    /// Returns an error for stale IDs, empty labels, missing active sessions, or
+    /// exhausted IDs. Validation failures leave state unchanged.
     pub fn apply(&mut self, command: Command) -> Result<(), WorkspaceError> {
         match command {
-            Command::CreateSession { title } => {
-                let title = valid_title(&title)?;
-                // Reserve both IDs before mutating, including on counter overflow.
-                let first = self
-                    .next_id
-                    .checked_add(1)
-                    .ok_or(WorkspaceError::IdExhausted)?;
-                let last = self
-                    .next_id
-                    .checked_add(2)
-                    .ok_or(WorkspaceError::IdExhausted)?;
-                let id = SessionId(first);
-                let pane = PaneId(last);
-                self.sessions.push(Session {
-                    id,
-                    title,
-                    layout: Layout::Pane(pane),
-                    active_pane: pane,
-                });
-                self.active_session = Some(id);
-                self.next_id = last;
-            }
+            Command::CreateSession { title } => self.create_session(&title)?,
             Command::SelectSession(id) => {
                 self.session_index(id)?;
                 self.active_session = Some(id);
@@ -208,48 +228,128 @@ impl Workspace {
                 let index = self.session_index(id)?;
                 self.remove_session(index);
             }
-            Command::SplitPane { pane, axis } => {
-                let index = self.pane_session_index(pane)?;
-                let next_id = self
-                    .next_id
-                    .checked_add(1)
-                    .ok_or(WorkspaceError::IdExhausted)?;
-                let added = PaneId(next_id);
-                self.sessions[index].layout.split(pane, added, axis);
-                self.sessions[index].active_pane = added;
-                self.active_session = Some(self.sessions[index].id);
-                self.next_id = next_id;
+            Command::CreateWindow { session, title } => self.create_window(session, &title)?,
+            Command::SelectWindow(id) => {
+                let (session, window) = self.window_index(id)?;
+                self.select_window(session, window);
             }
+            Command::RenameWindow { window, title } => {
+                let (session, index) = self.window_index(window)?;
+                self.sessions[session].windows[index].title = valid_title(&title)?;
+            }
+            Command::CloseWindow(id) => {
+                let (session, window) = self.window_index(id)?;
+                self.remove_window(session, window);
+            }
+            Command::NextWindow => self.cycle_window(true)?,
+            Command::PreviousWindow => self.cycle_window(false)?,
+            Command::SplitPane { pane, axis } => self.split_pane(pane, axis)?,
             Command::FocusPane(pane) => {
-                let index = self.pane_session_index(pane)?;
-                self.sessions[index].active_pane = pane;
-                self.active_session = Some(self.sessions[index].id);
+                let (session, window) = self.pane_index(pane)?;
+                self.sessions[session].windows[window].active_pane = pane;
+                self.select_window(session, window);
             }
-            Command::ClosePane(pane) => {
-                let index = self.pane_session_index(pane)?;
-                let session = &mut self.sessions[index];
-                if let Some(layout) = session.layout.clone().without(pane) {
-                    let panes = layout.panes();
-                    if session.active_pane == pane {
-                        session.active_pane = panes[0];
-                    }
-                    session.layout = layout;
-                } else {
-                    self.remove_session(index);
-                }
-            }
-            Command::FocusNextPane => {
-                let active = self.active_session.ok_or(WorkspaceError::NoActiveSession)?;
-                let index = self.session_index(active)?;
-                let session = &mut self.sessions[index];
-                let panes = session.layout.panes();
-                let position = panes
-                    .iter()
-                    .position(|pane| *pane == session.active_pane)
-                    .ok_or(WorkspaceError::UnknownPane(session.active_pane))?;
-                session.active_pane = panes[(position + 1) % panes.len()];
-            }
+            Command::ClosePane(pane) => self.close_pane(pane)?,
+            Command::FocusNextPane => self.cycle_pane()?,
         }
+        Ok(())
+    }
+
+    fn create_session(&mut self, title: &str) -> Result<(), WorkspaceError> {
+        let title = valid_title(title)?;
+        let last = self
+            .next_id
+            .checked_add(3)
+            .ok_or(WorkspaceError::IdExhausted)?;
+        let id = SessionId(last - 2);
+        let pane = PaneId(last);
+        self.sessions.push(Session {
+            id,
+            title,
+            active_window: 0,
+            windows: vec![WorkspaceWindow {
+                id: WindowId(last - 1),
+                title: "Terminal".into(),
+                layout: Layout::Pane(pane),
+                active_pane: pane,
+            }],
+        });
+        self.active_session = Some(id);
+        self.next_id = last;
+        Ok(())
+    }
+
+    fn create_window(&mut self, session: SessionId, title: &str) -> Result<(), WorkspaceError> {
+        let title = valid_title(title)?;
+        let index = self.session_index(session)?;
+        let last = self
+            .next_id
+            .checked_add(2)
+            .ok_or(WorkspaceError::IdExhausted)?;
+        let pane = PaneId(last);
+        self.sessions[index].windows.push(WorkspaceWindow {
+            id: WindowId(last - 1),
+            title,
+            layout: Layout::Pane(pane),
+            active_pane: pane,
+        });
+        self.select_window(index, self.sessions[index].windows.len() - 1);
+        self.next_id = last;
+        Ok(())
+    }
+
+    fn split_pane(&mut self, pane: PaneId, axis: SplitAxis) -> Result<(), WorkspaceError> {
+        let (session, window) = self.pane_index(pane)?;
+        let next = self
+            .next_id
+            .checked_add(1)
+            .ok_or(WorkspaceError::IdExhausted)?;
+        let added = PaneId(next);
+        let target = &mut self.sessions[session].windows[window];
+        target.layout.split(pane, added, axis);
+        target.active_pane = added;
+        self.select_window(session, window);
+        self.next_id = next;
+        Ok(())
+    }
+
+    fn close_pane(&mut self, pane: PaneId) -> Result<(), WorkspaceError> {
+        let (session, window) = self.pane_index(pane)?;
+        let target = &mut self.sessions[session].windows[window];
+        if let Some(layout) = target.layout.clone().without(pane) {
+            if target.active_pane == pane {
+                target.active_pane = layout.panes()[0];
+            }
+            target.layout = layout;
+        } else {
+            self.remove_window(session, window);
+        }
+        Ok(())
+    }
+
+    fn cycle_pane(&mut self) -> Result<(), WorkspaceError> {
+        let active = self.active_session.ok_or(WorkspaceError::NoActiveSession)?;
+        let index = self.session_index(active)?;
+        let session = &mut self.sessions[index];
+        let window = &mut session.windows[session.active_window];
+        let panes = window.layout.panes();
+        let position = panes
+            .iter()
+            .position(|pane| *pane == window.active_pane)
+            .ok_or(WorkspaceError::UnknownPane(window.active_pane))?;
+        window.active_pane = panes[(position + 1) % panes.len()];
+        Ok(())
+    }
+
+    fn cycle_window(&mut self, forward: bool) -> Result<(), WorkspaceError> {
+        let active = self.active_session.ok_or(WorkspaceError::NoActiveSession)?;
+        let index = self.session_index(active)?;
+        let session = &mut self.sessions[index];
+        session.active_window = if forward {
+            (session.active_window + 1) % session.windows.len()
+        } else {
+            (session.active_window + session.windows.len() - 1) % session.windows.len()
+        };
         Ok(())
     }
 
@@ -259,11 +359,46 @@ impl Workspace {
             .position(|session| session.id == id)
             .ok_or(WorkspaceError::UnknownSession(id))
     }
-    fn pane_session_index(&self, pane: PaneId) -> Result<usize, WorkspaceError> {
+    fn window_index(&self, id: WindowId) -> Result<(usize, usize), WorkspaceError> {
         self.sessions
             .iter()
-            .position(|session| session.layout.contains(pane))
+            .enumerate()
+            .find_map(|(s, session)| {
+                session
+                    .windows
+                    .iter()
+                    .position(|window| window.id == id)
+                    .map(|w| (s, w))
+            })
+            .ok_or(WorkspaceError::UnknownWindow(id))
+    }
+    fn pane_index(&self, pane: PaneId) -> Result<(usize, usize), WorkspaceError> {
+        self.sessions
+            .iter()
+            .enumerate()
+            .find_map(|(s, session)| {
+                session
+                    .windows
+                    .iter()
+                    .position(|window| window.layout.contains(pane))
+                    .map(|w| (s, w))
+            })
             .ok_or(WorkspaceError::UnknownPane(pane))
+    }
+    fn select_window(&mut self, session: usize, window: usize) {
+        self.sessions[session].active_window = window;
+        self.active_session = Some(self.sessions[session].id);
+    }
+    fn remove_window(&mut self, session: usize, window: usize) {
+        let target = &mut self.sessions[session];
+        target.windows.remove(window);
+        if target.windows.is_empty() {
+            self.remove_session(session);
+        } else if target.active_window > window {
+            target.active_window -= 1;
+        } else {
+            target.active_window = target.active_window.min(target.windows.len() - 1);
+        }
     }
     fn remove_session(&mut self, index: usize) {
         let removed = self.sessions.remove(index);
@@ -290,15 +425,17 @@ pub enum WorkspaceError {
     NoActiveSession,
     UnknownSession(SessionId),
     UnknownPane(PaneId),
+    UnknownWindow(WindowId),
     IdExhausted,
 }
 
 impl fmt::Display for WorkspaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyTitle => f.write_str("session title cannot be empty"),
+            Self::EmptyTitle => f.write_str("title cannot be empty"),
             Self::NoActiveSession => f.write_str("no session is selected"),
             Self::UnknownSession(id) => write!(f, "session {id} no longer exists"),
+            Self::UnknownWindow(id) => write!(f, "window {id} no longer exists"),
             Self::UnknownPane(id) => write!(f, "pane {id} no longer exists"),
             Self::IdExhausted => f.write_str("workspace ID space exhausted"),
         }
@@ -368,7 +505,7 @@ mod tests {
         let mut workspace = workspace();
         let old_pane = focused(&workspace);
         workspace.apply(Command::ClosePane(old_pane)).unwrap();
-        assert!(workspace.sessions().is_empty());
+        assert_eq!(workspace.sessions(), []);
         assert!(workspace.active_session().is_none());
         workspace
             .apply(Command::CreateSession {
@@ -476,5 +613,99 @@ mod tests {
             Err(WorkspaceError::IdExhausted)
         );
         assert_eq!(workspace, original);
+    }
+    #[test]
+    fn tabs_preserve_layout_and_focus_independently() {
+        let mut workspace = workspace();
+        let session = workspace.active_session().unwrap().id();
+        let first_window = workspace.active_session().unwrap().active_window().id();
+        let first_pane = focused(&workspace);
+        workspace
+            .apply(Command::SplitPane {
+                pane: first_pane,
+                axis: SplitAxis::Horizontal,
+            })
+            .unwrap();
+        let split_pane = focused(&workspace);
+        workspace
+            .apply(Command::CreateWindow {
+                session,
+                title: "Build".into(),
+            })
+            .unwrap();
+        let second_window = workspace.active_session().unwrap().active_window().id();
+        let second_pane = focused(&workspace);
+        assert_eq!(workspace.pane_ids().len(), 3);
+        workspace
+            .apply(Command::SelectWindow(first_window))
+            .unwrap();
+        assert_eq!(focused(&workspace), split_pane);
+        workspace.apply(Command::NextWindow).unwrap();
+        assert_eq!(
+            workspace.active_session().unwrap().active_window().id(),
+            second_window
+        );
+        assert_eq!(focused(&workspace), second_pane);
+        workspace.apply(Command::FocusPane(first_pane)).unwrap();
+        assert_eq!(
+            workspace.active_session().unwrap().active_window().id(),
+            first_window
+        );
+    }
+
+    #[test]
+    fn closing_inactive_tabs_preserves_selection_and_last_tab_closes_session() {
+        let mut workspace = workspace();
+        let session = workspace.active_session().unwrap().id();
+        let first_window = workspace.active_session().unwrap().active_window().id();
+        workspace
+            .apply(Command::CreateWindow {
+                session,
+                title: "Other".into(),
+            })
+            .unwrap();
+        let second_window = workspace.active_session().unwrap().active_window().id();
+        let second_pane = focused(&workspace);
+        workspace.apply(Command::CloseWindow(first_window)).unwrap();
+        assert_eq!(
+            workspace.active_session().unwrap().active_window().id(),
+            second_window
+        );
+        assert_eq!(focused(&workspace), second_pane);
+        workspace.apply(Command::ClosePane(second_pane)).unwrap();
+        assert_eq!(workspace.sessions(), []);
+    }
+
+    #[test]
+    fn invalid_tab_commands_are_atomic_and_labels_can_change() {
+        let mut workspace = workspace();
+        let session = workspace.active_session().unwrap().id();
+        let window = workspace.active_session().unwrap().active_window().id();
+        let original = workspace.clone();
+        for command in [
+            Command::CreateWindow {
+                session,
+                title: " ".into(),
+            },
+            Command::SelectWindow(WindowId(999)),
+            Command::CloseWindow(WindowId(999)),
+            Command::RenameWindow {
+                window,
+                title: " ".into(),
+            },
+        ] {
+            assert!(workspace.apply(command).is_err());
+            assert_eq!(workspace, original);
+        }
+        workspace
+            .apply(Command::RenameWindow {
+                window,
+                title: " Build ".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            workspace.active_session().unwrap().active_window().title(),
+            "Build"
+        );
     }
 }

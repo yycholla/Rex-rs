@@ -15,8 +15,8 @@ description = "Run pure state and rendering-data tests without dependency downlo
 run = "bash scripts/test-core.sh"
 
 [tasks.test]
-description = "Run all unit tests and the Ghostty integration smoke executable"
-run = ["cargo test --locked --all-targets", "cargo run --locked --no-default-features --features ghostty --bin ghostty-smoke"]
+description = "Run unit tests and Ghostty, input-protocol and real-PTY smoke checks"
+run = ["cargo test --locked --all-targets", "cargo run --locked --no-default-features --features ghostty --bin ghostty-smoke", "cargo run --locked --no-default-features --features ghostty --bin input-smoke", "cargo run --locked --no-default-features --features ghostty --bin pty-smoke"]
 
 [tasks.lint]
 description = "Run Clippy across the application"

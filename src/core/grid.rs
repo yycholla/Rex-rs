@@ -20,7 +20,6 @@ impl GridSize {
     }
 
     #[must_use]
-
     pub const fn columns(self) -> u16 {
         self.columns.get()
     }
@@ -56,10 +55,6 @@ impl fmt::Display for InvalidGridSize {
 impl std::error::Error for InvalidGridSize {}
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Tests assert fixture preconditions and should fail immediately when those preconditions break."
-)]
 mod tests {
     use super::*;
 

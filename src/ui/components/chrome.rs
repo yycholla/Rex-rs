@@ -28,11 +28,17 @@ pub fn session_item(session: &Session, selected: bool, theme: Theme) -> Stateful
         div()
             .text_xs()
             .text_color(rgb(theme.colors.muted))
-            .child(session.layout().panes().len().to_string()),
+            .child(format!("{} tabs", session.windows().len())),
     )
 }
 
-pub fn pane_header(title: impl Into<SharedString>, focused: bool, theme: Theme) -> Div {
+pub fn pane_header(
+    title: impl Into<SharedString>,
+    status: impl Into<SharedString>,
+    focused: bool,
+    theme: Theme,
+) -> Div {
+    let status: SharedString = status.into();
     let title: SharedString = title.into();
     div()
         .flex()
@@ -51,7 +57,7 @@ pub fn pane_header(title: impl Into<SharedString>, focused: bool, theme: Theme) 
             theme.colors.muted
         }))
         .child(title)
-        .child(section_label("PREVIEW", theme))
+        .child(section_label(status, theme))
 }
 
 #[must_use]

@@ -10,11 +10,14 @@ default-run = "rex-rs"
 anyhow = { version = "1", optional = true }
 gpui = { version = "=0.2.2", optional = true }
 libghostty-vt = { version = "=0.2.1", optional = true }
+portable-pty = { version = "0.9", optional = true }
+nix = { version = "0.29", features = ["signal", "process"], optional = true }
+unicode-segmentation = { version = "1", optional = true }
 
 [features]
 default = ["desktop"]
-ghostty = ["dep:anyhow", "dep:libghostty-vt"]
-desktop = ["ghostty", "dep:gpui"]
+ghostty = ["dep:anyhow", "dep:libghostty-vt", "dep:portable-pty", "dep:nix"]
+desktop = ["ghostty", "dep:gpui", "dep:unicode-segmentation"]
 
 [[bin]]
 name = "rex-rs"
@@ -24,6 +27,16 @@ required-features = ["desktop"]
 [[bin]]
 name = "ghostty-smoke"
 path = "src/bin/ghostty-smoke.rs"
+required-features = ["ghostty"]
+
+[[bin]]
+name = "pty-smoke"
+path = "src/bin/pty-smoke.rs"
+required-features = ["ghostty"]
+
+[[bin]]
+name = "input-smoke"
+path = "src/bin/input-smoke.rs"
 required-features = ["ghostty"]
 
 [lints.rust]

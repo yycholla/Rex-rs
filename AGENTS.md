@@ -2,7 +2,9 @@
 
 Build a Linux terminal workspace in Rust with GPUI and libghostty-vt.
 Read [README.md](README.md) and [docs/architecture.md](docs/architecture.md) first.
-The current UI is a preview; PTYs and Rex server compatibility are not implemented.
+Local PTYs and interactive terminal views are implemented. Read docs/parity.md
+for current coverage; persistent server sessions and Rex protocol compatibility
+are not implemented.
 
 ## Boundaries
 
@@ -10,6 +12,8 @@ The current UI is a preview; PTYs and Rex server compatibility are not implement
 - `terminal/ghostty.rs` owns all Ghostty FFI interaction. Its handles stay on their
   owning thread; never implement unsafe Send/Sync. Share owned frames instead.
 - `terminal/workspace.rs` owns terminal lifetimes and frame caches by PaneId.
+  `terminal/pty.rs` owns bounded IO workers and process cleanup; never block the
+  UI thread on reads, writes, or child waits.
 - `ui/components/` contains composable presentation. Use semantic theme tokens;
   keep workspace mutations, shell IO and process management out of components.
 - Buttons and shortcuts dispatch the same core Commands. Preserve stable IDs.
@@ -44,7 +48,7 @@ the combined result and runs the full checks after integrating.
   tests and Ghostty smoke checks, run sequentially to avoid Cargo lock contention.
 - `mise run test:core`: pure state/frame tests, no external crate downloads.
 - `mise run check`: formatting and compilation of all targets.
-- `mise run test`: unit tests and headless Ghostty smoke checks.
+- `mise run test`: unit tests and headless Ghostty/input/real-PTY smoke checks.
 - `mise run lint`: Clippy; `mise run dev`: manual desktop verification.
 - Keep Clippy `all` and `pedantic` enabled; lint warnings fail verification.
   Fix findings rather than weakening project settings. Any narrow allowance

@@ -1,6 +1,6 @@
 # Rex-rs
 
-A Linux terminal workspace scaffold in Rust, with GPUI for the interface and
+A native Linux terminal workspace in Rust, with GPUI for the interface and
 [libghostty-vt](https://github.com/Uzaaft/libghostty-rs) for terminal emulation.
 This is an independent implementation. Rex server compatibility is not implemented.
 
@@ -9,9 +9,7 @@ This is an independent implementation. Rex server compatibility is not implement
 ```sh
 mise trust
 mise install
-mise run test:core
-mise run check
-mise run smoke
+mise run verify
 mise run dev
 ```
 
@@ -37,7 +35,7 @@ missing system development libraries through the distribution's package manager.
 | `mise run dev` | Open the workspace shell |
 | `mise run test:core` | Test pure state and frame primitives without external crates |
 | `mise run check` | Check formatting and compile all targets |
-| `mise run test` | Run unit tests and the Ghostty integration smoke executable |
+| `mise run test` | Run unit tests plus Ghostty, input-protocol and real-PTY checks |
 | `mise run smoke` | Exercise Ghostty without a graphics session |
 | `mise run lint` | Run Clippy with warnings denied |
 
@@ -53,17 +51,18 @@ are needed; `mise run verify` is the required check before integration.
 
 ```text
 src/
-  core/              Session/pane IDs, split trees, commands, validated grid sizes,
+  core/              Session/window/pane IDs, split trees, commands, validated grid sizes,
                      owned terminal frames and text-run batching
-  terminal/          Ghostty adapter, terminal lifetime management, cached frames
+  terminal/          Ghostty adapter, bounded PTY workers, process lifetimes, cached frames
   ui/
     actions.rs       Keyboard actions and bindings
     theme.rs         Semantic colors, dimensions and terminal metrics
     components/      Buttons, session rows, pane headers, empty/status states,
-                     and a terminal preview surface
-    workspace.rs     Composition, focus and command dispatch
+                     reusable Unicode text fields and a styled terminal surface
+    terminal_view.rs Measured viewport, keyboard/IME input, selection and scrolling
+    workspace.rs     Sessions, tabs, rename dialogs, focus and command dispatch
   main.rs            Application and window bootstrap
-  bin/ghostty-smoke.rs
+  bin/               Ghostty, input-protocol and real-PTY smoke executables
 ```
 
 See [architecture](docs/architecture.md) for ownership, mutation boundaries,
@@ -72,39 +71,54 @@ See [AGENTS.md](AGENTS.md) for parallel workstreams and integration responsibili
 
 ## Workspace controls
 
-Buttons and shortcuts use the same command paths:
+Sessions contain tabs, and each tab contains a split layout of terminal panes.
+The default shell comes from an executable absolute `$SHELL`, with `/bin/sh` as
+fallback. It starts in the application's working directory. Each pane owns a real
+PTY; hidden tabs and sessions continue running while the app remains open.
 
 | Shortcut | Action |
 | --- | --- |
 | Ctrl+Shift+N | New session |
-| Ctrl+Shift+D | Split focused pane to the right |
-| Ctrl+Shift+E | Split focused pane below |
+| Ctrl+Shift+T | New tab |
+| Ctrl+PageUp / PageDown | Previous / next tab |
+| Ctrl+Shift+D / E | Split right / below |
 | Ctrl+Tab | Focus the next pane |
-| Ctrl+Shift+W | Close the focused pane |
-| Ctrl+Alt+W | Close the selected session |
+| Ctrl+Shift+Z | Zoom / unzoom the focused pane |
+| Ctrl+Shift+C / V | Copy selection / paste |
+| Ctrl+Shift+R | Rename session |
+| Ctrl+Alt+Shift+R | Rename tab |
+| Ctrl+Shift+W | Close focused pane |
+| Ctrl+Alt+Shift+W | Close selected tab |
+| Ctrl+Alt+W | Close selected session |
 | Ctrl+Shift+Q | Quit |
 
-Click a session to select it; click a pane to focus it. Closing the last pane
-closes its session. When no sessions remain, the shell shows an empty state.
-The core also supports renaming sessions; a rename control is not wired yet.
+Click a session or tab to select it, click a terminal to focus it, and drag to
+select text. Scroll to browse history. Closing a tab's last pane closes that
+tab; closing a session's last tab closes that session. Rename dialogs support
+Unicode text, Enter to save and Escape to cancel. Keyboard shortcuts for the
+workspace are suspended while a rename dialog is open.
 
-## Current limits and validation
+## Backend and current limits
 
-Panes are explicitly previews with sample output, not interactive shells.
-The adapter preserves graphemes, physical cells, colors, styles and cursor
-position. The preview batches styled text runs and uses provisional monospace
-metrics. It does not yet implement PTYs, measured font layout, viewport resizing,
-selection, clipboard, full text decorations, image rendering or persistent sessions.
+Shell transport, terminal parsing and GPUI presentation are separate modules.
+IO workers use bounded queues. Closing a pane cleans up its shell and verified
+foreground process group without waiting for child exit on the UI thread.
+Terminal responses go back to the PTY, and measured viewport changes resize
+both the terminal state and the PTY. The Ghostty encoder handles key/paste modes.
 
-Validated with `mise run check`, `mise run test`, and `mise run lint`:
-nine unit tests pass, plus the headless Ghostty smoke checks for VT parsing,
-colors, erase-line handling, resizing, query responses and pane lifetimes.
-The desktop preview has been launched and its initial layout visually checked
-on Wayland. Complete interaction testing remains to be done.
+This is not full Rex parity yet. The current backend lives inside the desktop
+process: quitting closes its PTYs, and sessions do not survive restart. A local
+server with attach/reconnect is the next major backend milestone. Official Rex
+server protocol compatibility is not implemented, and the macOS server bundled
+in the DMG cannot run natively on Linux.
 
-## Next milestone
+Selection is currently viewport-local, and copied rows do not yet distinguish
+soft wraps from explicit newlines. Mouse reporting to terminal applications,
+full graphics/decorations, terminal search, resizable split ratios, Lua config,
+CLI automation, remote access and collaboration remain work ahead.
 
-Measure terminal font metrics, connect viewport size to Ghostty resize, and add
-PTY output/input with explicit process cleanup. Keep transport outside components
-and keep Ghostty objects on their owning thread. Persistence and remote Rex
-sessions can follow a working local terminal.
+See [the parity tracker](docs/parity.md) for the implementation boundary and next
+workstreams. Core and text-field unit tests plus the terminal integration smoke
+executables are included in `mise run verify`. Desktop interaction checks on
+Wayland cover typing, Unicode, tabs, splits, focus and zoom. Real IME composition
+and full terminal application compatibility still need broader manual testing.
