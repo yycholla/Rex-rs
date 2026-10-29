@@ -339,3 +339,18 @@ through `REX_RS_RENDER_STATS`; see
 - Report recoverable errors with context; do not silently replace failed shells.
 - Keep Cargo.lock and dependency/toolchain pins coordinated by the integration owner.
 - Use disjoint agent write sets and run `mise run verify` after integration.
+
+### Styled glyph fallback
+
+`ui/components/terminal_surface/fallback.rs` retries unresolved slanted glyph
+clusters with normal-style font requests. It preserves whole graphemes and shaping
+clusters, retains weight/features, and accepts only complete nonmissing retry
+clusters. Unaffected glyph geometry is kept exactly from the primary shape.
+Available upright CJK faces are an explicit fallback policy; synthetic italic is
+not implemented. Normal rows take the existing path, and resolved styled rows
+skip retry partitioning. A validated missing-glyph probe is cached per text system
+and primary font. Paint-only changes continue to reuse cached geometry.
+
+`REX_RS_GLYPH_TRACE` enables bounded diagnostic records (256 per process): `1`
+selects all nonempty rows, another nonempty value filters by substring. Records
+include terminal text and font/glyph identities; tracing is disabled by default.
