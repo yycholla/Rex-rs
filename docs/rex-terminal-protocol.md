@@ -23,26 +23,22 @@ message are fed as live data after import. The older published Ghostty Rust
 bindings lack snapshot import; this is the concrete reason for the pinned
 snapshot-capable binding update.
 
-The server can additionally emit optional Kitty graphics records: tag 8 stores
-image/placement metadata, tag 9 carries pixel payloads and tag 10 carries
-history-page placements. The pinned decoder predates these additions and rejects
-their tags. The Ghostty adapter verifies each omitted record's CRC32C and removes
-only these explicitly optional graphics records before importing the remaining
-snapshot. Text, history, modes and continuation records remain unchanged and
-undergo native validation. This client currently renders terminal text; imported
-snapshot graphics are not displayed. Corrupt optional graphics still fail import.
-Failed display streams retain their last frame but reject typing and paste;
-input resumes only after a stream has restored a valid terminal state.
+Kitty graphics records use tag 8 for image/placement metadata, tag 9 for pixels
+and tag 10 for history placements. The vendored `libghostty-vt-sys` retains the
+pinned wrapper/native base and applies six upstream snapshot commits plus a
+static built-in PNG decoder. Patch identities and hashes are recorded in
+`vendor/libghostty-vt-sys/PROVENANCE.json`. Patches apply only to an owned build
+source copy. Snapshot checksums and native record validation remain mandatory.
 
-This compatibility behavior follows Ghostty's documented optional-record rules
-introduced in [781c58e9665ae6409f98d29fe8372e9cad7fd078](https://github.com/ghostty-org/ghostty/commit/781c58e9665ae6409f98d29fe8372e9cad7fd078),
-with graphics records defined by
-[f48c2606ce951c2d90af6c88bdf9853bd4d33efc](https://github.com/ghostty-org/ghostty/commit/f48c2606ce951c2d90af6c88bdf9853bd4d33efc)
-and [04f20eb161288d3bb9980533a3acc7180b7ea0c0](https://github.com/ghostty-org/ghostty/commit/04f20eb161288d3bb9980533a3acc7180b7ea0c0).
-The upstream rule explicitly requires a terminal to remain correct when an
-optional record is skipped; changes to existing mandatory records require a
-format version change. Unknown tags outside this compatibility set continue to
-fail native validation.
+Image pixels and placements cross the worker boundary as owned data. The UI
+clips source rectangles and paints three native layers around cell backgrounds
+and text. Unchanged text rows and image pixels retain their caches. Native image
+storage is 16 MiB per screen; visible owned pixels and textures are each bounded
+to 16 MiB, images to 4096 pixels per dimension, and placements to 4096. PNG decode
+uses a 64 MiB transient allocation cap. File and shared-memory image transports
+are disabled in replicas. Oversized/unavailable graphics produce an omission
+message while text remains usable. Only visible live streams advance animation;
+hidden panes release UI textures. Replicas never send graphics-query replies.
 
 Live bytes include the program's VT output and Rex APC sequences:
 `ESC _ rex1;<decimal nonce>;<JSON> ESC \\`. Only a matching nonce authorizes

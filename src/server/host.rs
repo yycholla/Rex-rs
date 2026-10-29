@@ -958,6 +958,8 @@ mod tests {
         let mut cells = vec![Cell::default(); usize::from(columns)];
         cells[0].text = text.into();
         Arc::new(TerminalFrame {
+            images: Arc::default(),
+            graphics_warning: None,
             size: GridSize::new(columns, 1).unwrap(),
             rows: vec![Arc::new(cells)],
             cursor: None,

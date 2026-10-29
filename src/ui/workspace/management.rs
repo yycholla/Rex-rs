@@ -136,9 +136,8 @@ impl WorkspaceView {
         if let Some(session) = session {
             for tab in session.windows() {
                 let anchors: Vec<_> = tab
-                    .layout()
+                    .placed_panes()
                     .into_iter()
-                    .flat_map(super::Layout::panes)
                     .filter(|pane| *pane != source)
                     .collect();
                 if anchors.is_empty() {

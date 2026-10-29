@@ -1,6 +1,19 @@
 //! Bounded envelopes for the Rex control WebSocket protocol.
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use serde_json::{Value, json};
+
+/// A server-reported API failure, retained for cross-server callback replies.
+#[derive(Debug)]
+pub struct RemoteError {
+    pub code: String,
+    pub message: String,
+}
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Rex {}: {}", self.code, self.message)
+    }
+}
+impl std::error::Error for RemoteError {}
 
 pub const API_REVISION: u64 = 7;
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
@@ -51,11 +64,14 @@ pub fn response(value: &Value, expected_id: &str) -> Result<(u64, Value)> {
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("Rex response lacks sequence"))?;
     if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
-        bail!(
-            "Rex {}: {}",
-            error["code"].as_str().unwrap_or("error"),
-            error["message"].as_str().unwrap_or("request failed")
-        );
+        return Err(RemoteError {
+            code: error["code"].as_str().unwrap_or("error").to_owned(),
+            message: error["message"]
+                .as_str()
+                .unwrap_or("request failed")
+                .to_owned(),
+        }
+        .into());
     }
     Ok((
         sequence,

@@ -22,13 +22,13 @@ features whose contracts the live server already establishes.
 | Sessions/windows/blocks | Authoritative views and inventory, stable identities, create/close/rename, focus/zoom, same-session move/swap across tabs, drag tab reorder, detached browser/restoration and windowless sessions | Richer drag placement and accessibility |
 | Splits | Fraction-preserving tiled trees and draggable dividers through Rex commands | Floating-layer rendering/interaction |
 | Terminal state | Ghostty snapshot import, history, VT/theme/resize/exit, native cursor shape/color/blink, underline variants/colors, faint/strike/overline and text blink | Broader mixed-script/full-screen/graphics and platform coverage |
-| Input | Ordered Rex keys with server Lua handling, committed Unicode/IME text, bracketed paste, application focus events and mode-aware mouse buttons/drag/hover | Real IME testing, physical/shifted-symbol key data, configurable Quit and broader terminal input protocols |
-| Viewport/clipboard | Measured sizes, per-block size ownership, local history scroll, native persistent selection/autoscroll, logical soft-wrap/Unicode copy, history search and application wheel reporting with Shift override | Program clipboard integration, hyperlinks, broader resize/ownership/IME checks and dense-search optimization |
+| Input | Ordered Rex keys with server Lua handling, committed Unicode/IME text, bracketed paste, application focus events and mode-aware mouse buttons/drag/hover | Real IME testing and broader terminal input protocols |
+| Viewport/clipboard | Measured sizes, per-block size ownership, local history scroll, native persistent selection/autoscroll, logical soft-wrap/Unicode copy, history search and application wheel reporting with Shift override | Broader clipboard/link desktop, resize/ownership and IME checks |
 | Process lifetime | Rex owns processes; desktop detach/reopen and block detach/restore retain the original shell PID | Recovery beyond Rex server guarantees is outside client ownership |
 | Reconnect | Control token resume and bootstrap; data byte-count resume or fresh snapshot; stale work rejected | Broader sustained-output and crash stress testing |
 | Shared clients | External changes via events; per-block size ownership; input independent of ownership | Richer ownership presentation and remote connection setup |
-| Unsupported state | Empty/windowless sessions and detached inventory are supported; floating layers and unknown creators disclosed | Full nonterminal rendering and floating-layer interaction |
-| Automation | Official Rex CLI/API, 35 native actions, client scripts, merged shortcuts/modes/sequences, ordered Lua/block actions and real results | Platform key-data gaps, recorded shortcut settings, command palette, nested worker callbacks and cross-server routing |
+| Unsupported state | Empty/windowless sessions and detached inventory are supported; floating layers rendered and unknown creators disclosed | Full nonterminal rendering and broader floating-layer desktop validation |
+| Automation | Official Rex CLI/API, 37 native actions, client scripts, merged shortcuts/modes/sequences, ordered Lua/block actions and real results | Recorded shortcut settings and nested mutating callbacks |
 | Verification | Native isolated Rex smoke plus existing regression/unit gates | Manual desktop interaction, accessibility and visual fidelity checks |
 
 ## Functional milestones
@@ -40,10 +40,10 @@ reference application.
 
 | Order | Milestone | Completion checks |
 | --- | --- | --- |
-| 1 | Client actions and configuration | Implemented: 35 strict declarations, shared dispatch/validated targets, FIFO callbacks/results, generation rejection and bounded transport. Merged configuration bindings/removals, Lua/block `client.action` and its returned native actions, startup `client.set_script`, sequence prefixes, stacked/exclusive/one-shot modes and diagnostics now reach the UI. Keys, pointer focus and layout commands queue behind action chains; new-pane typing waits for readiness, buffered modal input stays in rename. Still partial: GPUI erases shifted-symbol/physical key data; Quit is reserved, recorded shortcut settings and nested worker callbacks remain. Broader Wayland/IME and recovery checks still needed. |
+| 1 | Client actions and configuration | Implemented: 37 strict declarations, shared dispatch/validated targets, FIFO callbacks/results, generation rejection and bounded transport. Merged configuration bindings/removals, Lua/block `client.action` and its returned native actions, startup `client.set_script`, sequence prefixes, stacked/exclusive/one-shot modes and diagnostics now reach the UI. Keys, pointer focus and layout commands queue behind action chains; new-pane typing waits for readiness, buffered modal input stays in rename. Physical keys, shifted symbols, configurable Quit and a command palette are implemented in the current integration; recorded shortcut settings and nested mutating callbacks remain. Broader Wayland/IME and recovery checks still needed. |
 | 2 | Terminal focus and mouse input | Implemented: ordered `block.event` focus-in/out, mouse buttons/drag/hover by requested mode, Shift local selection, outside release and held-button cleanup. Native fixtures cover modes 1000/1002/1003/1004, modifiers, coordinates, mode-only changes and held gestures across reconnection. The isolated X11 desktop fixture exercises actual pointer/focus routing. Broader Wayland/IME and protocol coverage remains ongoing. |
 | 3 | Pane and tab management | Implemented move/swap and tab reorder through shared core commands and declared actions, a pane Arrange chooser and sidebar tab dragging (drop before a tab or onto New Tab for the end). Isolated native checks cover shell PIDs/output/owners, same/cross-tab moves, closing an empty source tab, focus/zoom, exact unaffected split IDs/ratios, no-op reorder, invalid targets, replica convergence and reconnect aliases. Actual X11 chooser/drag checks pass. Detached discovery, new-tab restoration, placement beside a tiled anchor and explicit closure are implemented; their current validation status is below. Richer placement gestures and broader accessibility/Wayland checks remain. |
-| 4 | Selection, copy, search and metadata | Implemented native persistent selection across local history, autoscroll, logical soft-wrap/Unicode copy and incremental literal search with older/newer navigation. Verified generation cancellation, isolated replicas, same-instance query restoration, exact data resume, exited history, native/API and desktop clipboard routing. Still missing: hyperlinks and program clipboard events. Dense-search worker optimization and broader interaction checks remain. |
+| 4 | Selection, copy, search and metadata | Implemented native persistent selection across local history, autoscroll, logical soft-wrap/Unicode copy and incremental literal search with older/newer navigation. Verified generation cancellation, isolated replicas, same-instance query restoration, exact data resume, exited history, native/API and desktop clipboard routing. Hyperlinks and program clipboard events are implemented in the current integration. Dense-search worker optimization is recorded below; broader interaction checks remain. |
 | 5 | Terminal fidelity | Implemented native cursor shape/color/blink/wide-tail and all underline kinds/colors in owned frames, faint/strike/overline and paint-only text/cursor blink. Direct VT, real Rex snapshot/stream and X11 pixel fixtures pass; glyph geometry remains reusable. Styled missing-glyph fallback now retries suitable upright faces while preserving resolved glyphs; broader mixed-script/full-screen/graphics and platform checks remain open. |
 | 6 | Rich layouts and block capabilities | Render/interact with floating layers while preserving Rex layout semantics. Detached placement is covered by pane management. Dispatch nonterminal creators by advertised capability; retain explicit unsupported states for creators without a renderer. |
 | 7 | Remote attachment | Add configured HTTP/WebSocket/Tailscale endpoints and identity/error handling without moving process ownership into the client. Test revoked access, dropped streams, new-server instances and exact data resume. |
@@ -77,14 +77,12 @@ Sequence mismatch drops the consumed prefix and retries the current key. There i
 no invented sequence timeout. One-shot modes leave after a resolved shortcut,
 except explicit exit actions handle their own pop. Those edge policies are local
 choices where the available reference contract does not establish more detail.
-Physical key resolution is tested in the pure resolver but cannot yet be supplied
-by the GPUI adapter; shifted punctuation has the same platform-data limitation.
-Client script paths are explicit startup options, not an inferred reference-client
-configuration convention. Nested callbacks needing the worker during Lua execution
-are refused to prevent a cycle, and remain a parity gap. Long-running Lua calls
-also occupy the terminal worker until the RPC returns; terminal decoding during
-such actions still needs an asynchronous worker operation pump. Ordinary typing
-uses the existing fast path.
+Physical key resolution now receives Linux XKB position metadata from the vendored
+GPUI patch; shifted punctuation retains raw modifiers. Client script paths are
+explicit startup options, not an inferred reference-client configuration convention.
+Nested callbacks needing ordered mutations during Lua execution are refused to
+prevent a cycle. The pending operation pump services existing streams and local
+selection copies while awaiting Lua; newly queued mutations remain ordered.
 
 For each milestone, check ordinary typing, scrolling, tab changes and dense-output
 responsiveness against the current Linux baseline. Keep hidden-frame deferral,
@@ -208,8 +206,88 @@ guard passes at all three grids; it excludes GUI/display timing and does not iso
 a speedup due to this change. Evidence is retained in
 the presentation bundle (local audit evidence).
 
-Styled CJK fallback remains a concrete pre-existing gap: old/new italic glyph pixels
-are identical despite correct UTF-8 and installed regular CJK coverage. The pinned
-shaper filters regular faces from italic fallback candidates. See
-the next investigation (local audit evidence); a live missing-glyph
-trace and targeted fallback implementation still need verification.
+The styled CJK follow-up now retries unresolved slanted clusters with suitable
+upright faces, retaining bold weight, whole graphemes and unaffected glyph geometry.
+The fallback is intentionally upright; synthetic italic and broad mixed-script
+fidelity remain open. Normal rows avoid probing, resolved styled rows skip retry
+partitioning, and paint-only changes retain cached geometry.
+
+The full integration gate passes 269 tests and all smoke executables. Isolated
+X11 traces and pixel checks verify regular/italic/bold/bold-italic CJK, nonmissing
+replacement glyphs, two-cell width and preservation of neighboring text, combining,
+emoji, Cyrillic and existing Tamil fallback glyphs. The prior cursor/decoration
+presentation fixture also passes. The fixture does not establish actual ligature
+shaping or the precise family/style of the Tamil fallback face. Evidence is kept
+locally under `docs/audits/rex-20261028/styled-cjk/`.
+
+An untraced dense guard uses two 51×35 panes and three redraws of 30 rows. Recorded
+fallback-frame preparation CPU is approximately 0.95–7.27 ms, versus 0.23–1.37 ms
+for regular rows; the largest recorded fallback slice is 6.28 ms. These are
+rate-limited preparation samples with repeated row content, not display/input
+latency, a historical speed comparison, or a bound on diverse cold text. Fallback
+still performs a second shape for unresolved rows; dense search and broader
+rendering responsiveness remain separate follow-up work.
+
+The dense-search worker follow-up reuses owned visible/selected spans during
+history-only progress and avoids redundant feeds on due visible refreshes. Mutation,
+query/navigation, viewport and visibility changes still force fresh native spans.
+The full gate passes 271 tests and all smoke checks. A matched two-visible-pane
+stress run measured input-to-cache p50/p95 39.43/94.22 ms versus 59.44/143.31 ms
+before this change; cancellation remained about 9.5 ms. The final search completed
+with 755,440 matches and preserved the expected input and layout invariants.
+These are single-run workload observations, not display latency or a general bound.
+Query replacement still took roughly 95–169 ms, and synchronous native search work
+remains open. Exact inputs and results are retained locally in
+`docs/audits/rex-20261028/search-worker/`.
+
+The rebuilt isolated X11 search fixture also passes: keyboard/native actions,
+Unicode/soft-wrap and cross-history copy, Shift override, release/blur cleanup and
+unchanged server input/size/owner/PID. Broader Wayland/IME and general desktop load
+remain unverified.
+
+## Integration follow-up (2026-10-29)
+
+The current implementation adds floating-layer rendering and move/resize/stacking
+controls, a registry-backed command palette and configurable Quit, Linux native
+physical/shifted-symbol shortcut metadata, explicit TCP/TLS endpoints, OSC 8
+hyperlink activation, authoritative program-clipboard writes, and a pending Lua
+operation pump. The pump keeps existing terminal streams and nested local copy
+responsive while preserving ordering for mutations. The combined `mise run verify`
+gate passes formatting, all-target compilation, strict Clippy, 329 tests and all
+Ghostty, input, PTY, private-server, CLI and native Rex smoke checks.
+`mise run test:core` separately passes all 34 tests. Earlier pass counts above
+refer to their recorded revisions.
+
+Isolated X11 desktop checks pass floating move/resize/stacking, palette and Quit,
+German physical-key and shifted-symbol bindings, OSC 8 activation, and inline
+and chunked program clipboard writes. Graphics checks pass native snapshot
+restoration, raw RGBA and PNG, crop and stacking, replacement/deletion, enlarged
+one-pixel opacity, Shift-wheel history, animation and reattachment with unchanged
+shell PID. Local evidence is retained under
+`docs/audits/rex-20261029/floating-ui/` and
+`docs/audits/rex-20261029/graphics-ui/`; the captured API-7 graphics snapshot is
+tracked in `tests/fixtures/graphics-rex-api7.bin` with provenance alongside it.
+These checks do not establish exhaustive graphics protocol or compositor parity.
+
+Remaining scope includes nested mutating callbacks, nonterminal creator renderers,
+recorded shortcut settings, semantic accessibility, and real compositor/IME
+interaction coverage.
+Stream handshakes, recovery and post-action refresh still contain synchronous
+worker work; the pending-operation pump does not make the entire worker async.
+The GPUI patch preserves text delivery but synthetic tests do not establish real
+IME behavior. TLS uses system trust and hostname verification; interactive login
+and Tailscale account selection are not implemented.
+
+Named-server routing and bounded Kitty graphics rendering are implemented in this
+integration. Native snapshot support is backported without changing the wrapper
+revision. The saved creator inventory contains terminal and onboarding;
+onboarding exposes state/set_step but supplies no walkthrough content or assets,
+so its faithful rendering remains a reference-evidence gap.
+
+An isolated API-7 probe confirmed why nested layout/input callbacks remain refused:
+while `client.action` waited on its callback, `session.set_label` completed, but a
+valid `session.new_split` remained queued. The outer action timed out at about
+5,003 ms and the split then mutated the workspace at about 5,004 ms. Admitting
+such requests on the originating connection would therefore risk a mutation
+after the action reported failure. Local selection-copy callbacks are independent
+of this server queue and are covered by the native smoke test.

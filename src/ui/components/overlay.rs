@@ -186,3 +186,60 @@ pub fn segment(
         .hover(move |style| style.bg(rgb(colors.selected)).text_color(rgb(colors.text)))
         .child(label)
 }
+
+/// A floating menu panel. Callers position it and attach dismissal.
+#[must_use]
+pub fn menu_panel(theme: Theme) -> Div {
+    let colors = theme.colors;
+    div()
+        .flex()
+        .flex_col()
+        .w(px(176.))
+        .p_1()
+        .rounded(px(8.))
+        .bg(rgb(colors.raised))
+        .border_1()
+        .border_color(rgb(colors.border_strong))
+        .shadow_lg()
+        .text_size(px(12.))
+}
+
+/// One command inside a `menu_panel`. Destructive items use the danger tint.
+pub fn menu_item(
+    id: impl Into<ElementId>,
+    glyph: super::Icon,
+    label: impl Into<SharedString>,
+    destructive: bool,
+    theme: Theme,
+) -> Stateful<Div> {
+    let label: SharedString = label.into();
+    let colors = theme.colors;
+    let tint = if destructive {
+        colors.danger
+    } else {
+        colors.text
+    };
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .h(px(28.))
+        .px_2()
+        .rounded(px(6.))
+        .cursor_pointer()
+        .text_color(rgb(tint))
+        .hover(move |style| style.bg(rgb(colors.selected)))
+        .child(super::icon(glyph, 13., tint))
+        .child(label)
+}
+
+/// A hairline between groups of menu items.
+#[must_use]
+pub fn menu_separator(theme: Theme) -> Div {
+    div()
+        .flex_none()
+        .h(px(1.))
+        .my_1()
+        .bg(rgb(theme.colors.border))
+}

@@ -1,0 +1,47 @@
+{
+  "wrapper_revision": "9ede35b8ea94a55ed3608408d67e102883129f1e",
+  "native_revision": "521cf2c5d30bd48028ca61546c64e7913764073d",
+  "upstream_patches": [
+    {
+      "commit": "eea7beaf7857eb416f0934c9899cf68425104b26",
+      "file": "01-eea7beaf7.patch",
+      "sha256": "0d66bae916a4ba19175e19f738725cb489682df2e3491eae848295608e1f7449"
+    },
+    {
+      "commit": "781c58e9665ae6409f98d29fe8372e9cad7fd078",
+      "file": "02-781c58e96.patch",
+      "sha256": "0ff2c70afa1cf15299d3aa95315780559c39dc7c511c29c5ca99520c9378f819"
+    },
+    {
+      "commit": "5a31f469b641d2b2107d5f147464417502134f54",
+      "file": "03-5a31f469b.patch",
+      "sha256": "536e9c4aaf008785b25e50d4d256bba22e0f064bc28a3653cfcab01cfba751f6"
+    },
+    {
+      "commit": "f48c2606ce951c2d90af6c88bdf9853bd4d33efc",
+      "file": "04-f48c2606c.patch",
+      "sha256": "65cf9403f4429d24e0a95ca26f624b3fa3903f42d3a2caf720329cdd8b71b265"
+    },
+    {
+      "commit": "04f20eb161288d3bb9980533a3acc7180b7ea0c0",
+      "file": "05-04f20eb16.patch",
+      "sha256": "c04a66f2a8ce089db6cc4188650020b28d90f18486753256261b6be772b4df28"
+    },
+    {
+      "commit": "7fdd2df67ac61762912468d3fe9676fd766c20be",
+      "file": "06-7fdd2df67.patch",
+      "sha256": "113938d04ecd96548f350012256822f3ab8004811d7155bbc7cbd5b1d14fbe45"
+    }
+  ],
+  "local_changes": [
+    "Standalone package metadata",
+    "Apply patch set only in owned OUT_DIR source",
+    "Static built-in Wuffs PNG decoder for Kitty builds",
+    "64MiB transient image decode cap",
+    "16MiB native snapshot image storage per screen"
+  ],
+  "local_patch": {
+    "file": "07-rex-builtin-png.patch",
+    "sha256": "7807d842a2f46d81d013344d8a8fb65e6c4f564f6e7a4e061929940e31f9456f"
+  }
+}

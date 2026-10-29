@@ -1075,6 +1075,8 @@ mod tests {
                     pane,
                     PaneSnapshot {
                         frame: Arc::new(TerminalFrame {
+                            images: Arc::default(),
+                            graphics_warning: None,
                             size: GridSize::default(),
                             rows: Vec::new(),
                             cursor: None,

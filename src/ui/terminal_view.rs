@@ -32,6 +32,11 @@ use crate::core::{
 #[derive(Clone, Debug)]
 pub enum TerminalViewEvent {
     Focused,
+    OpenLink {
+        column: u16,
+        row: u16,
+        viewport_token: u64,
+    },
     FocusChanged(bool),
     Mouse(MouseInput),
     /// Local display selection; never delivered to the terminal application.
@@ -271,6 +276,7 @@ pub struct TerminalView {
     scale_factor: f32,
     measured_metrics: Option<(&'static str, u32, u32)>,
     surface_cache: TerminalSurfaceCache,
+    image_window: Option<gpui::AnyWindowHandle>,
     displayed_frame: Option<Arc<TerminalFrame>>,
     preparation: Option<TerminalSurfacePreparation>,
     annotations: Arc<TerminalAnnotations>,
@@ -300,6 +306,7 @@ impl TerminalView {
             scale_factor: 1.,
             measured_metrics: None,
             surface_cache: TerminalSurfaceCache::default(),
+            image_window: None,
             displayed_frame: None,
             preparation: None,
             annotations: Arc::default(),
@@ -316,6 +323,35 @@ impl TerminalView {
             desired_focus: false,
             reported_focus: None,
             animation: BlinkAnimation::default(),
+        }
+    }
+
+    fn observe_input_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_subscriptions.is_empty() {
+            let handle = window.window_handle();
+            self.focus_subscriptions
+                .push(cx.on_release(move |view, cx| {
+                    let _ =
+                        handle.update(cx, |_, window, _| view.surface_cache.release_images(window));
+                }));
+            self.focus_subscriptions
+                .push(cx.on_focus(&self.focus, window, |view, window, cx| {
+                    cx.emit(TerminalViewEvent::Focused);
+                    view.report_focus(window, cx);
+                    cx.notify();
+                }));
+            self.focus_subscriptions
+                .push(cx.on_blur(&self.focus, window, |view, window, cx| {
+                    view.report_focus(window, cx);
+                    cx.notify();
+                }));
+            self.focus_subscriptions.push(cx.observe_window_activation(
+                window,
+                |view, window, cx| {
+                    view.report_focus(window, cx);
+                    cx.notify();
+                },
+            ));
         }
     }
 
@@ -338,6 +374,18 @@ impl TerminalView {
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.animation.visible != visible {
             self.animation.visible = visible;
+            if !visible && let Some(handle) = self.image_window {
+                let entity = cx.entity().downgrade();
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = entity.update(cx, |view, _| {
+                            if !view.animation.visible {
+                                view.surface_cache.release_images(window);
+                            }
+                        });
+                    });
+                });
+            }
             if visible {
                 self.animation.cursor_epoch = Instant::now();
             }
@@ -664,6 +712,22 @@ impl TerminalView {
         self.focus.focus(window);
         // An already focused terminal still needs to reclaim interaction.
         cx.emit(TerminalViewEvent::Interacted);
+        if event.button == MouseButton::Left
+            && event.modifiers.control
+            && !event.modifiers.shift
+            && let (Some(cell), Some((_, _, viewport_token))) = (
+                self.cell_at(event.position),
+                self.selection_position(event.position),
+            )
+        {
+            cx.emit(TerminalViewEvent::OpenLink {
+                column: cell.column,
+                row: cell.row,
+                viewport_token,
+            });
+            cx.stop_propagation();
+            return;
+        }
         if let (Some(cell), Some(button)) =
             (self.cell_at(event.position), terminal_button(event.button))
             && self.send_mouse(
@@ -766,17 +830,12 @@ impl TerminalView {
             return;
         }
         self.reset_cursor_blink(cx);
-        let key = &event.keystroke;
         // GPUI dispatches matching application keybindings before this raw
         // listener; unhandled keys belong to the terminal backend.
-        let modifiers = Modifiers {
-            shift: key.modifiers.shift,
-            control: key.modifiers.control,
-            alt: key.modifiers.alt,
-            super_key: key.modifiers.platform,
-        };
+        let (input, _) = super::platform_input::shortcut_input(event);
+        let modifiers = input.modifiers;
         let plain = !modifiers.control && !modifiers.alt && !modifiers.super_key;
-        let printable = key.key_char.as_ref().is_some_and(|text| {
+        let printable = input.text.as_ref().is_some_and(|text| {
             !text.is_empty() && text.chars().all(|character| !character.is_control())
         });
         if plain && (printable || !self.marked_text.is_empty()) {
@@ -785,12 +844,7 @@ impl TerminalView {
             return;
         }
         self.clear_selection(cx);
-        cx.emit(TerminalViewEvent::Key(KeyInput {
-            key: key.key.clone(),
-            text: key.key_char.clone(),
-            modifiers,
-            repeat: event.is_held,
-        }));
+        cx.emit(TerminalViewEvent::Key(input));
         cx.stop_propagation();
     }
 
@@ -798,7 +852,12 @@ impl TerminalView {
         // Scrollback and selection belong to the local display replica. Disabling
         // process input must not disable browsing or copying already shown text.
         let height = self.theme.terminal.cell_height;
-        self.scroll_remainder += f32::from(event.delta.pixel_delta(px(height)).y) / height;
+        let delta = event.delta.pixel_delta(px(height));
+        self.scroll_remainder += vertical_wheel_delta(
+            f32::from(delta.x),
+            f32::from(delta.y),
+            event.modifiers.shift,
+        ) / height;
         let lines = bounded_scroll(self.scroll_remainder);
         if lines != 0 {
             // The bounded range is exactly representable by f32.
@@ -958,6 +1017,12 @@ impl TerminalView {
     }
 }
 
+// GPUI's X11 backend maps Shift-wheel onto x. Terminal Shift-wheel explicitly
+// means local vertical history, while ordinary horizontal scrolling stays ignored.
+fn vertical_wheel_delta(x: f32, y: f32, shift: bool) -> f32 {
+    if shift && y == 0.0 { x } else { y }
+}
+
 impl Drop for TerminalView {
     fn drop(&mut self) {
         // Invalidate any queued wake before cancelling the retained task.
@@ -974,29 +1039,11 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.image_window = Some(window.window_handle());
         let metrics_changed = self.measure(window);
         self.advance_surface(window, cx);
         self.report_focus(window, cx);
-        if self.focus_subscriptions.is_empty() {
-            self.focus_subscriptions
-                .push(cx.on_focus(&self.focus, window, |view, window, cx| {
-                    cx.emit(TerminalViewEvent::Focused);
-                    view.report_focus(window, cx);
-                    cx.notify();
-                }));
-            self.focus_subscriptions
-                .push(cx.on_blur(&self.focus, window, |view, window, cx| {
-                    view.report_focus(window, cx);
-                    cx.notify();
-                }));
-            self.focus_subscriptions.push(cx.observe_window_activation(
-                window,
-                |view, window, cx| {
-                    view.report_focus(window, cx);
-                    cx.notify();
-                },
-            ));
-        }
+        self.observe_input_window(window, cx);
         let mut root = div()
             .id("terminal-viewport")
             .relative()
@@ -1035,6 +1082,18 @@ impl Render for TerminalView {
                 self.theme,
                 window,
             ));
+        }
+        if let Some(warning) = &self.frame.graphics_warning {
+            root = root.child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .text_size(px(11.))
+                    .bg(rgb(self.theme.colors.surface))
+                    .text_color(rgb(self.theme.colors.muted))
+                    .child(warning.clone()),
+            );
         }
         root = root.when_some(self.annotation_overlay(), |root, overlay| {
             root.child(overlay)
@@ -1278,6 +1337,14 @@ fn bounded_scroll(value: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shift_wheel_recovers_x11_vertical_history_without_repurposing_normal_horizontal_scroll() {
+        assert_eq!(vertical_wheel_delta(48., 0., true), 48.);
+        assert_eq!(vertical_wheel_delta(48., 0., false), 0.);
+        assert_eq!(vertical_wheel_delta(48., -24., true), -24.);
+        assert_eq!(vertical_wheel_delta(0., -24., false), -24.);
+    }
 
     #[test]
     fn hidden_terminal_reannounces_latest_focus_when_input_becomes_ready() {
@@ -1569,6 +1636,8 @@ mod tests {
     fn annotations_only_target_the_current_displayed_frame()
     -> Result<(), crate::core::InvalidGridSize> {
         let frame = Arc::new(TerminalFrame {
+            images: Arc::default(),
+            graphics_warning: None,
             size: GridSize::new(2, 1)?,
             rows: Vec::new(),
             cursor: None,

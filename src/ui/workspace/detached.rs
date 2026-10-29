@@ -14,7 +14,10 @@ use gpui::{
 
 impl WorkspaceView {
     pub(super) fn has_modal(&self) -> bool {
-        self.rename.is_some() || self.arranging.is_some() || self.detached_browser.is_some()
+        self.rename.is_some()
+            || self.arranging.is_some()
+            || self.detached_browser.is_some()
+            || self.palette.is_some()
     }
 
     pub(super) fn request_detached_browser(
@@ -49,7 +52,7 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<ActionFuture, ActionError> {
-        if self.rename.is_some() {
+        if self.rename.is_some() || self.palette.is_some() {
             return Err(ActionError::refused(
                 "Finish renaming before browsing detached blocks",
             ));
@@ -226,8 +229,12 @@ impl WorkspaceView {
                     .child("No detached blocks in this session."),
             );
         }
-        let can_place =
-            entry.is_some_and(|entry| entry.windows().iter().any(|tab| tab.layout().is_some()));
+        let can_place = entry.is_some_and(|entry| {
+            entry
+                .windows()
+                .iter()
+                .any(|tab| !tab.placed_panes().is_empty())
+        });
         for block in entries {
             list = list.child(self.detached_row(block, can_place, cx));
         }

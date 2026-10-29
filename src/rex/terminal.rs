@@ -1,5 +1,5 @@
 //! Rex terminal data channel. Construct and poll on the terminal owner worker.
-use super::transport::open_websocket;
+use super::{endpoint::RexStream, transport::open_websocket};
 use crate::{
     core::{
         GridSize,
@@ -16,7 +16,6 @@ use serde_json::Value;
 use std::{
     fmt::Write as _,
     io::ErrorKind,
-    os::unix::net::UnixStream,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -65,7 +64,7 @@ impl Welcome {
 /// A decoded terminal and its ordered, resumable data channel.
 /// Ghostty stays on this object's owning thread; only owned frames leave it.
 pub struct TerminalStream {
-    socket: WebSocket<UnixStream>,
+    socket: WebSocket<RexStream>,
     endpoint: String,
     welcome: Welcome,
     received: u64,
@@ -132,6 +131,13 @@ impl TerminalStream {
         // Annotation progress belongs to the owner loop even for hidden or
         // exited replicas; it does not depend on incoming VT or cell copies.
         self.decoder.interaction_tick()?;
+        if materialize
+            && self.decoder.exit_code.is_none()
+            && let Some(terminal) = &mut self.decoder.terminal
+            && terminal.graphics_tick()?
+        {
+            self.decoder.frame_pending = true;
+        }
         if !materialize
             || (!self.decoder.publication.immediate_frame
                 && self.decoder.exit_code.is_none()
@@ -313,6 +319,23 @@ impl TerminalStream {
             .map_or(Ok(None), GhosttyTerminal::copy_selection)
     }
 
+    /// Resolve an OSC 8 link against the displayed viewport on its owner thread.
+    ///
+    /// # Errors
+    /// Rejects stale viewport tokens, invalid cells and oversized native URIs.
+    pub fn hyperlink_at(
+        &mut self,
+        column: u16,
+        row: u16,
+        viewport_token: u64,
+    ) -> Result<Option<String>> {
+        self.decoder
+            .terminal
+            .as_mut()
+            .context("Local terminal history is unavailable")?
+            .hyperlink_at(column, row, viewport_token)
+    }
+
     /// Whether an application requested mouse input instead of local history.
     ///
     /// # Errors
@@ -377,12 +400,13 @@ impl Drop for TerminalStream {
     }
 }
 
-fn handshake(endpoint: &str, request: Vec<u8>) -> Result<(WebSocket<UnixStream>, Welcome)> {
+fn handshake(endpoint: &str, request: Vec<u8>) -> Result<(WebSocket<RexStream>, Welcome)> {
     let mut socket = open_websocket(endpoint, "/api/data", SUBPROTOCOL)?;
     socket.set_config(|config| {
         config.max_message_size = Some(MAX_CHUNK_BYTES);
         config.max_frame_size = Some(MAX_CHUNK_BYTES);
     });
+    let _deadline = socket.get_ref().handshake_guard(Duration::from_secs(3))?;
     socket.send(Message::Binary(request.into()))?;
     let Message::Binary(bytes) = socket.read()? else {
         bail!("Rex data handshake did not return binary welcome");

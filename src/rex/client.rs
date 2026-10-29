@@ -3,6 +3,7 @@ use super::{
     actions::{self, NativeAction},
     automation::{self, ActionContext, ActionFuture, ActionSender, ClientActionRequest},
     diagnostics,
+    servers::{NamedServer, OrderedLease, ServerLease},
     terminal::TerminalStream,
     transport::{ControlConnection, default_endpoint},
     workspace::{BlockView, SessionView, WorkspaceState},
@@ -22,7 +23,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, PoisonError, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
@@ -32,6 +33,8 @@ use std::{
 };
 
 mod interaction;
+mod pending;
+mod physical;
 use interaction::{LocalOperation, SearchIntent};
 
 const COMMAND_CAPACITY: usize = 64;
@@ -85,6 +88,12 @@ struct Cache {
     script_attempt: Option<(String, String)>,
 }
 
+struct ClipboardDelivery {
+    instance: String,
+    generation: u64,
+    write: super::clipboard::ClipboardWrite,
+}
+
 #[derive(Default)]
 struct Mailbox {
     latest: Option<Cache>,
@@ -99,6 +108,10 @@ struct Mailbox {
     action_bytes: usize,
     callback_ids: VecDeque<(u64, String)>,
     worker_action_active: bool,
+    server_lease: Option<Weak<ServerLease>>,
+    callback_local: VecDeque<QueuedOperation>,
+    clipboard: VecDeque<ClipboardDelivery>,
+    clipboard_bytes: usize,
 }
 
 struct Update(Arc<Mutex<Mailbox>>);
@@ -110,6 +123,7 @@ impl Future for Update {
         if mailbox.latest.is_some()
             || !mailbox.errors.is_empty()
             || !mailbox.client_actions.is_empty()
+            || !mailbox.clipboard.is_empty()
         {
             return Poll::Ready(());
         }
@@ -210,6 +224,16 @@ impl WorkspaceClient {
 
     #[must_use]
     pub fn connect(endpoint: String) -> Self {
+        Self::connect_configured(endpoint, None)
+    }
+
+    /// Connect a configured server name to the desktop's shared peer registry.
+    #[must_use]
+    pub fn connect_named(endpoint: String, named: NamedServer) -> Self {
+        Self::connect_configured(endpoint, Some(named))
+    }
+
+    fn connect_configured(endpoint: String, named: Option<NamedServer>) -> Self {
         let (commands, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
         let mailbox = Arc::new(Mutex::new(Mailbox::default()));
         let stopped = Arc::new(AtomicBool::new(false));
@@ -218,7 +242,13 @@ impl WorkspaceClient {
         let result = thread::Builder::new()
             .name("rex-client".into())
             .spawn(move || {
-                worker(&endpoint, &receiver, &worker_mailbox, &worker_stopped);
+                worker(
+                    &endpoint,
+                    &receiver,
+                    &worker_mailbox,
+                    &worker_stopped,
+                    named.as_ref(),
+                );
             });
         let client = Self {
             cache: Cache::default(),
@@ -297,7 +327,9 @@ impl WorkspaceClient {
     /// Returns the next worker error, after installing any received state.
     pub fn poll(&mut self) -> Result<bool> {
         let mut mailbox = self.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
-        let changed = mailbox.latest.is_some() || !mailbox.client_actions.is_empty();
+        let changed = mailbox.latest.is_some()
+            || !mailbox.client_actions.is_empty()
+            || !mailbox.clipboard.is_empty();
         if let Some(cache) = mailbox.latest.take() {
             self.cache = cache;
         }
@@ -305,6 +337,28 @@ impl WorkspaceClient {
             bail!("{error}");
         }
         Ok(changed)
+    }
+
+    /// Drain authoritative program clipboard writes for the still-focused block.
+    /// The UI separately requires this application's window to be active.
+    pub fn take_program_clipboard(&mut self) -> Vec<String> {
+        let mut mailbox = self.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
+        mailbox.clipboard_bytes = 0;
+        mailbox
+            .clipboard
+            .drain(..)
+            .filter_map(|delivery| {
+                (self.cache.connected
+                    && delivery.instance == self.cache.state.instance_id()
+                    && delivery.generation == self.cache.connection_generation
+                    && clipboard_target(
+                        &self.cache,
+                        &delivery.write.session_id,
+                        &delivery.write.block_id,
+                    ))
+                .then_some(delivery.write.text)
+            })
+            .collect()
     }
 
     pub fn take_client_actions(&mut self) -> Vec<ClientActionRequest> {
@@ -783,6 +837,10 @@ fn key_payload(key: &KeyInput) -> Value {
             }
         },
     );
+    let physical = key
+        .physical_key
+        .as_deref()
+        .map_or(physical, |code| physical::protocol_key(code).to_owned());
     json!({"key":physical,"mods":mods,"consumed_mods":"", "text":key.text.as_deref().unwrap_or(""),
         "unshifted_codepoint":character.map_or(0, |character| u32::from(character.to_ascii_lowercase())),
         "composing":false,"action":if key.repeat {"repeat"} else {"press"}})
@@ -794,12 +852,15 @@ fn worker(
     commands: &Receiver<QueuedOperation>,
     mailbox: &Arc<Mutex<Mailbox>>,
     stopped: &AtomicBool,
+    named: Option<&NamedServer>,
 ) {
     diagnostics::write("INFO", "client", &format!("connecting endpoint={endpoint}"));
     let mut cache = Cache::default();
     let mut token = None;
     while !stopped.load(Ordering::Acquire) {
-        let result = connected_worker(endpoint, commands, mailbox, stopped, &mut cache, &mut token);
+        let result = connected_worker(
+            endpoint, commands, mailbox, stopped, &mut cache, &mut token, named,
+        );
         if cache.connected {
             diagnostics::write(
                 "INFO",
@@ -808,6 +869,12 @@ fn worker(
             );
         }
         cache.connected = false;
+        {
+            let mut mailbox = mailbox.lock().unwrap_or_else(PoisonError::into_inner);
+            mailbox.callback_local.clear();
+            mailbox.clipboard.clear();
+            mailbox.clipboard_bytes = 0;
+        }
         cache.annotations.clear();
         publish(mailbox, &cache);
         if let Err(error) = result {
@@ -830,15 +897,15 @@ fn worker(
     }
 }
 
-fn connected_worker(
+fn bootstrap_connection(
     endpoint: &str,
-    commands: &Receiver<QueuedOperation>,
-    mailbox: &Arc<Mutex<Mailbox>>,
-    stopped: &AtomicBool,
+    control: &mut ControlConnection,
     cache: &mut Cache,
     token: &mut Option<String>,
-) -> Result<()> {
-    let mut control = ControlConnection::connect_with_resume(endpoint, token.as_deref())?;
+    mailbox: &Arc<Mutex<Mailbox>>,
+    attached: &mut BTreeSet<String>,
+    named: Option<&NamedServer>,
+) -> Result<(u64, Option<Arc<ServerLease>>)> {
     cache.ready.clear();
     cache.mouse_tracking.clear();
     cache.keymap = Arc::new(Value::Null);
@@ -856,9 +923,8 @@ fn connected_worker(
         cache.statuses.clear();
         cache.mouse_buttons.clear();
     }
-    let mut attached = BTreeSet::new();
-    attach_sessions(&mut control, cache, &mut attached)?;
-    release_reconnected_buttons(&mut control, cache)?;
+    attach_sessions(control, cache, attached)?;
+    release_reconnected_buttons(control, cache)?;
     cache.connection_generation = cache
         .connection_generation
         .checked_add(1)
@@ -875,15 +941,80 @@ fn connected_worker(
     );
     cache.state_revision = cache.state_revision.wrapping_add(1);
     publish(mailbox, cache);
-    register_client_actions(&mut control, cache, mailbox)?;
-    let mut sequence = bootstrap_seq;
+    let lease = named
+        .map(|named| {
+            named
+                .register(
+                    cache.state.instance_id().to_owned(),
+                    cache.connection_generation,
+                    control.handle(),
+                )
+                .map(Arc::new)
+        })
+        .transpose()?;
+    mailbox
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .server_lease = lease.as_ref().map(Arc::downgrade);
+    let _ordered = ordered_lease(mailbox)?;
+    register_client_actions(control, cache, mailbox)?;
+    Ok((bootstrap_seq, lease))
+}
+
+fn connected_worker(
+    endpoint: &str,
+    commands: &Receiver<QueuedOperation>,
+    mailbox: &Arc<Mutex<Mailbox>>,
+    stopped: &AtomicBool,
+    cache: &mut Cache,
+    token: &mut Option<String>,
+    named: Option<&NamedServer>,
+) -> Result<()> {
+    let mut control = ControlConnection::connect_with_resume(endpoint, token.as_deref())?;
+    let mut attached = BTreeSet::new();
+    let (mut sequence, _server_lease) = bootstrap_connection(
+        endpoint,
+        &mut control,
+        cache,
+        token,
+        mailbox,
+        &mut attached,
+        named,
+    )?;
     let mut streams = BTreeMap::new();
     let mut retry_streams = BTreeMap::new();
     let mut stream_cursor = 0;
     let mut fetched_titles = BTreeMap::new();
     let mut inventories = super::inventory::RefreshQueue::default();
     let mut insights = super::insights::RefreshQueue::default();
+    let mut pending_work: Option<pending::PendingWork> = None;
+    let mut clipboard = super::clipboard::ClipboardTransfers::default();
     while !stopped.load(Ordering::Acquire) {
+        pending::service_local(cache, &mut streams, mailbox);
+        if let Some(work) = &mut pending_work {
+            if let Poll::Ready(result) = work.poll() {
+                if let Some(work) = pending_work.take() {
+                    work.finish(result, &mut control, cache);
+                }
+            } else {
+                let visible = visible_panes(&cache.state);
+                if poll_streams(
+                    None,
+                    cache,
+                    &mut streams,
+                    &mut retry_streams,
+                    &mut stream_cursor,
+                    mailbox,
+                    &visible,
+                )? {
+                    publish(mailbox, cache);
+                }
+                // No new ordered requests until the originating action completes.
+                // Replies and local callback copies have independent bounded lanes.
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+        }
         let completion = process_commands(
             &mut control,
             cache,
@@ -891,13 +1022,19 @@ fn connected_worker(
             commands,
             mailbox,
             &mut insights,
+            &mut pending_work,
         );
+        if pending_work.is_some() {
+            continue;
+        }
         let mut state_changed = refresh_events(
             &mut control,
             cache,
             &mut attached,
             &mut sequence,
             &fetched_titles,
+            &mut clipboard,
+            mailbox,
         )?;
         if let Some(session) = inventories.next_session(&cache.state) {
             match super::inventory::refresh(&mut control, &mut cache.state, &session) {
@@ -925,11 +1062,111 @@ fn connected_worker(
             publish(mailbox, cache);
         }
         insights.service(&control.handle(), &cache.state);
+        service_clipboard(&mut clipboard, &control, cache, mailbox);
         if let Some((sender, result)) = completion {
             sender.send(result);
         }
     }
+    clipboard.disconnect();
     Ok(())
+}
+
+fn service_clipboard(
+    clipboard: &mut super::clipboard::ClipboardTransfers,
+    control: &ControlConnection,
+    cache: &Cache,
+    mailbox: &Mutex<Mailbox>,
+) {
+    match clipboard.poll(&control.handle()) {
+        Ok(Some(write)) if clipboard_target(cache, &write.session_id, &write.block_id) => {
+            let mut target = mailbox.lock().unwrap_or_else(PoisonError::into_inner);
+            if target.clipboard.len() < 8
+                && target.clipboard_bytes.saturating_add(write.text.len()) <= 4 * 1024 * 1024
+            {
+                target.clipboard_bytes += write.text.len();
+                target.clipboard.push_back(ClipboardDelivery {
+                    instance: cache.state.instance_id().to_owned(),
+                    generation: cache.connection_generation,
+                    write,
+                });
+                if let Some(waiter) = target.waiter.take() {
+                    waiter.wake();
+                }
+            } else {
+                drop(target);
+                record_error(
+                    mailbox,
+                    "Program clipboard delivery queue is full; write discarded".into(),
+                );
+            }
+        }
+        Err(error) => record_error(mailbox, format!("Program clipboard: {error:#}")),
+        _ => {}
+    }
+}
+
+fn ordered_lease(mailbox: &Mutex<Mailbox>) -> Result<Option<OrderedLease>> {
+    let lease = mailbox
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .server_lease
+        .as_ref()
+        .and_then(Weak::upgrade);
+    lease.map(|lease| lease.try_ordered()).transpose()
+}
+
+fn operation_lease(
+    operation: &Operation,
+    mailbox: &Mutex<Mailbox>,
+) -> Result<Option<OrderedLease>> {
+    // Async Lua/key/script requests acquire and retain their own lease. Pure
+    // replica queries and background metadata cannot invoke ordered callbacks.
+    if matches!(
+        operation,
+        Operation::Local(..)
+            | Operation::RefreshInventory(..)
+            | Operation::RefreshInsights(..)
+            | Operation::SetScripts(..)
+            | Operation::ServerAction(..)
+            | Operation::Key(..)
+            | Operation::KeySequence(..)
+            | Operation::Text(..)
+            | Operation::Scroll(..)
+    ) {
+        return Ok(None);
+    }
+    ordered_lease(mailbox)
+}
+
+fn reject_ordered_operation(operation: Operation, error: anyhow::Error, mailbox: &Mutex<Mailbox>) {
+    let error = error.context("Rex operation was not sent");
+    record_error(mailbox, format!("{error:#}"));
+    match operation {
+        Operation::NativeAction(_, _, completion)
+        | Operation::ActionCommand(_, completion)
+        | Operation::ActionPaste(_, _, completion) => completion.send(Err(error)),
+        _ => {}
+    }
+}
+
+fn queued_operation_current(
+    cache: &Cache,
+    queued: &QueuedOperation,
+    mailbox: &Mutex<Mailbox>,
+) -> bool {
+    if queued.instance == cache.state.instance_id()
+        && (queued.generation == cache.connection_generation
+            || interaction::is_query_update(&queued.operation))
+    {
+        return true;
+    }
+    if !matches!(queued.operation, Operation::Local(..)) {
+        record_error(
+            mailbox,
+            "Rex instance changed; stale operation was not sent".into(),
+        );
+    }
+    false
 }
 
 fn process_commands(
@@ -939,24 +1176,23 @@ fn process_commands(
     commands: &Receiver<QueuedOperation>,
     mailbox: &Arc<Mutex<Mailbox>>,
     insights: &mut super::insights::RefreshQueue,
+    pending_work: &mut Option<pending::PendingWork>,
 ) -> Option<(ActionSender, Result<Value>)> {
     let command_start = Instant::now();
     for _ in 0..16 {
         let Some(queued) = next_operation(commands, mailbox) else {
             break;
         };
-        if queued.instance != cache.state.instance_id()
-            || (queued.generation != cache.connection_generation
-                && !interaction::is_query_update(&queued.operation))
-        {
-            if !matches!(queued.operation, Operation::Local(..)) {
-                record_error(
-                    mailbox,
-                    "Rex instance changed; stale operation was not sent".into(),
-                );
-            }
+        if !queued_operation_current(cache, &queued, mailbox) {
             continue;
         }
+        let _ordered = match operation_lease(&queued.operation, mailbox) {
+            Ok(lease) => lease,
+            Err(error) => {
+                reject_ordered_operation(queued.operation, error, mailbox);
+                continue;
+            }
+        };
         let operation = match queued.operation {
             Operation::Local(pane, operation) => {
                 let copy = matches!(operation, LocalOperation::Copy(_));
@@ -976,14 +1212,15 @@ fn process_commands(
                 continue;
             }
             Operation::SetScripts(scripts, completion) => {
-                let result = install_scripts(control, cache, scripts, mailbox);
-                publish_configuration_result(cache, mailbox, &result);
-                return Some((completion, result));
+                *pending_work =
+                    pending::PendingWork::scripts(control, cache, scripts, completion, mailbox);
+                return None;
             }
             Operation::ServerAction(name, args, context, completion) => {
-                let result = execute_server_action(control, cache, &name, &args, &context, mailbox);
-                publish_configuration_result(cache, mailbox, &result);
-                return Some((completion, result));
+                *pending_work = pending::PendingWork::server(
+                    control, cache, &name, &args, &context, completion, mailbox,
+                );
+                return None;
             }
             Operation::ActionCommand(command, completion) => {
                 let result = execute_action_command(control, cache, &command);
@@ -1006,6 +1243,16 @@ fn process_commands(
                 break;
             }
             continue;
+        }
+        if matches!(
+            &operation,
+            Operation::Key(..) | Operation::KeySequence(..) | Operation::Text(..)
+        ) {
+            match pending::PendingWork::key(control, cache, streams, operation, mailbox) {
+                Ok(work) => *pending_work = work,
+                Err(error) => record_error(mailbox, format!("Rex key: {error:#}")),
+            }
+            return None;
         }
         let workspace_command = matches!(&operation, Operation::Command(_));
         match perform(control, cache, streams, operation) {
@@ -1158,7 +1405,10 @@ fn action_needs_worker(name: &str, args: &Value) -> bool {
     actions::parse(name, args).is_ok_and(|action| {
         !matches!(
             action,
-            NativeAction::FontIncrease
+            NativeAction::TogglePalette
+                | NativeAction::Quit
+                | NativeAction::Copy
+                | NativeAction::FontIncrease
                 | NativeAction::FontDecrease
                 | NativeAction::FontReset
                 | NativeAction::ToggleSidebar
@@ -1192,22 +1442,6 @@ fn script_identity(cache: &Cache) -> (String, String) {
     )
 }
 
-fn install_scripts(
-    control: &mut ControlConnection,
-    cache: &mut Cache,
-    scripts: Vec<ClientScript>,
-    mailbox: &Mutex<Mailbox>,
-) -> Result<Value> {
-    let params = scripts_params(&scripts)?;
-    // Source code may execute mutations while loading. Do not automatically
-    // repeat an uncertain load for this same retained client identity.
-    cache.script_attempt = Some(script_identity(cache));
-    let result = guarded_worker_rpc(control, mailbox, "client.set_script", params)?;
-    cache.scripts = Arc::new(scripts);
-    refresh_keymap(control, cache)?;
-    Ok(result)
-}
-
 fn restore_scripts(
     control: &mut ControlConnection,
     cache: &mut Cache,
@@ -1227,21 +1461,6 @@ fn restore_scripts(
         Err(error) => record_error(mailbox, format!("restore Rex client scripts: {error:#}")),
     }
     Ok(())
-}
-
-fn execute_server_action(
-    control: &mut ControlConnection,
-    cache: &mut Cache,
-    name: &str,
-    args: &Value,
-    context: &ActionContext,
-    mailbox: &Mutex<Mailbox>,
-) -> Result<Value> {
-    automation::validate_context(&cache.state, context)?;
-    let params = server_action_params(name, args, context)?;
-    let response = guarded_worker_rpc(control, mailbox, "client.action", params)?;
-    refresh_all_views(control, cache)?;
-    Ok(response)
 }
 
 fn refresh_all_views(control: &mut ControlConnection, cache: &mut Cache) -> Result<()> {
@@ -1288,7 +1507,25 @@ fn register_client_actions(
     let generation = cache.connection_generation;
     let handle = control.handle();
     let callback_mailbox = Arc::clone(mailbox);
+    let lease = mailbox
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .server_lease
+        .clone();
     control.set_callback_handler(Arc::new(move |event| {
+        if let Some(lease) = lease.as_ref().and_then(Weak::upgrade) {
+            match lease.route_event(&event) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    record_error(
+                        &callback_mailbox,
+                        format!("Cross-server callback: {error:#}"),
+                    );
+                    return;
+                }
+            }
+        }
         queue_client_action(&callback_mailbox, &event, &instance, generation, &handle);
     }));
     cache.keymap = Arc::new(control.call(
@@ -1327,7 +1564,12 @@ fn queue_client_action(
         && mailbox.action_bytes.saturating_add(bytes) <= super::protocol::MAX_PENDING_EVENT_BYTES;
     match result {
         Ok(request)
-            if mailbox.worker_action_active
+            if (mailbox.worker_action_active
+                || mailbox
+                    .server_lease
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|lease| lease.ordered_active()))
                 && action_needs_worker(&request.action, &request.args) =>
         {
             drop(mailbox);
@@ -1392,12 +1634,24 @@ fn execute_native_action(
     result
 }
 
+fn clipboard_target(cache: &Cache, session: &str, block: &str) -> bool {
+    cache.state.active_session().is_some_and(|active| {
+        active.remote_id() == session
+            && active
+                .active_pane()
+                .and_then(|pane| cache.state.pane(pane))
+                .is_some_and(|pane| pane.is_terminal() && pane.remote_id == block)
+    })
+}
+
 fn refresh_events(
     control: &mut ControlConnection,
     cache: &mut Cache,
     attached: &mut BTreeSet<String>,
     sequence: &mut u64,
     title_sequences: &BTreeMap<PaneId, u64>,
+    clipboard: &mut super::clipboard::ClipboardTransfers,
+    mailbox: &Mutex<Mailbox>,
 ) -> Result<bool> {
     let mut state_changed = false;
     let mut list_changed = false;
@@ -1417,6 +1671,17 @@ fn refresh_events(
             "Rex event sequence gap; reconnect and bootstrap"
         );
         *sequence = seq;
+        let session = &event["payload"]["payload"];
+        if clipboard_target(
+            cache,
+            session["session_id"].as_str().unwrap_or(""),
+            session["event"]["payload"]["block_id"]
+                .as_str()
+                .unwrap_or(""),
+        ) && let Err(error) = clipboard.accept_event(&event)
+        {
+            record_error(mailbox, format!("Program clipboard: {error:#}"));
+        }
         let event = &event["payload"];
         match event["type"].as_str() {
             Some("keymap_changed") => keymap_changed = true,
@@ -1840,6 +2105,7 @@ fn perform_focus(
 
 fn text_key_payload(text: String) -> Value {
     let key = KeyInput {
+        physical_key: None,
         key: if text.chars().count() == 1 {
             text.clone()
         } else {
@@ -2079,11 +2345,7 @@ fn service_streams(
     }
     streams.retain(|pane, _| ids.contains(pane));
     retry.retain(|pane, _| ids.contains(pane));
-    cache.frames.retain(|pane, _| ids.contains(pane));
-    cache.statuses.retain(|pane, _| ids.contains(pane));
-    cache.ready.retain(|pane| ids.contains(pane));
-    cache.mouse_tracking.retain(|pane, _| ids.contains(pane));
-    cache.mouse_buttons.retain(|pane, _| ids.contains(pane));
+    retain_placed_presentations(cache, &ids);
     let mut ids: Vec<_> = ids
         .into_iter()
         .filter(|id| cache.state.pane(*id).is_some_and(BlockView::is_terminal))
@@ -2149,8 +2411,24 @@ fn service_streams(
             }
         }
     }
-    changed |= poll_streams(control, cache, streams, retry, cursor, mailbox, &visible)?;
-    Ok(changed)
+    Ok(changed
+        | poll_streams(
+            Some(control),
+            cache,
+            streams,
+            retry,
+            cursor,
+            mailbox,
+            &visible,
+        )?)
+}
+
+fn retain_placed_presentations(cache: &mut Cache, ids: &[PaneId]) {
+    cache.frames.retain(|pane, _| ids.contains(pane));
+    cache.statuses.retain(|pane, _| ids.contains(pane));
+    cache.ready.retain(|pane| ids.contains(pane));
+    cache.mouse_tracking.retain(|pane, _| ids.contains(pane));
+    cache.mouse_buttons.retain(|pane, _| ids.contains(pane));
 }
 
 fn retain_admitted_presentations(cache: &mut Cache, admitted: &BTreeSet<PaneId>) {
@@ -2193,7 +2471,7 @@ fn open_terminal(
 }
 
 fn poll_streams(
-    control: &mut ControlConnection,
+    mut control: Option<&mut ControlConnection>,
     cache: &mut Cache,
     streams: &mut BTreeMap<PaneId, TerminalStream>,
     retry: &mut BTreeMap<PaneId, StreamRetry>,
@@ -2269,6 +2547,12 @@ fn poll_streams(
                 }
             }
             Err(error) => {
+                let Some(control) = control.as_deref_mut() else {
+                    // Recovery requires ordered RPCs; defer it until the pending
+                    // Lua call drains, retaining the last owned screen meanwhile.
+                    changed |= cache.ready.remove(&pane);
+                    continue;
+                };
                 if recover_terminal_stream(control, cache, pane, stream, retry, mailbox, &error)? {
                     streams.remove(&pane);
                     cache.annotations.remove(&pane);
@@ -2515,6 +2799,7 @@ mod tests {
     #[test]
     fn key_sequences_and_busy_callback_classification_are_explicit() -> Result<()> {
         let key = KeyInput {
+            physical_key: None,
             key: "x".into(),
             text: Some("x".into()),
             modifiers: Modifiers::default(),
@@ -2529,7 +2814,7 @@ mod tests {
         ));
         assert!(action_needs_worker("client.paste", &Value::Null));
         assert!(!action_needs_worker("client.font.increase", &Value::Null));
-        assert!(action_needs_worker("client.copy", &Value::Null));
+        assert!(!action_needs_worker("client.copy", &Value::Null));
         assert!(!action_needs_worker("unimplemented-action", &Value::Null));
         Ok(())
     }
@@ -2606,6 +2891,7 @@ mod tests {
     #[test]
     fn keys_preserve_lua_modifiers_and_unicode() {
         let value = key_payload(&KeyInput {
+            physical_key: None,
             key: "n".into(),
             text: None,
             modifiers: Modifiers {
@@ -2618,6 +2904,7 @@ mod tests {
         assert_eq!(value["mods"], "ctrl");
         assert_eq!(value["unshifted_codepoint"], 110);
         let value = key_payload(&KeyInput {
+            physical_key: None,
             key: "unidentified".into(),
             text: Some("日本語".into()),
             modifiers: Modifiers::default(),
@@ -2625,6 +2912,25 @@ mod tests {
         });
         assert_eq!(value["text"], "日本語");
         assert_eq!(value["key"], "unidentified");
+    }
+
+    #[test]
+    fn physical_key_and_layout_character_remain_independent() {
+        let mut key = KeyInput {
+            physical_key: Some("KeyQ".into()),
+            key: "a".into(),
+            text: Some("a".into()),
+            modifiers: Modifiers::default(),
+            repeat: false,
+        };
+        let value = key_payload(&key);
+        assert_eq!(value["key"], "key_q");
+        assert_eq!(value["text"], "a");
+        assert_eq!(value["unshifted_codepoint"], 97);
+        key.physical_key = Some("CustomHardwarePosition".into());
+        assert_eq!(key_payload(&key)["key"], "unidentified");
+        key.physical_key = Some("NumpadEnter".into());
+        assert_eq!(key_payload(&key)["key"], "numpad_enter");
     }
 
     #[test]
@@ -2659,6 +2965,8 @@ mod tests {
         cache.frames.insert(
             pane,
             Arc::new(TerminalFrame {
+                images: Arc::default(),
+                graphics_warning: None,
                 size: GridSize::new(1, 1)?,
                 rows: vec![Arc::new(vec![Cell::default()])],
                 cursor: None,
@@ -2720,6 +3028,8 @@ mod tests {
         let failed = panes[0];
         let healthy = panes[1];
         let frame = Arc::new(TerminalFrame {
+            images: Arc::default(),
+            graphics_warning: None,
             size: GridSize::new(1, 1)?,
             rows: vec![Arc::new(vec![Cell::default()])],
             cursor: None,

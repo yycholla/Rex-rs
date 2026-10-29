@@ -29,6 +29,8 @@ pub struct Colors {
     /// Dialog and drawer footers, a step below the raised surface.
     pub footer: u32,
     pub danger: u32,
+    /// Transitional states such as a connection in progress.
+    pub warning: u32,
     pub success: u32,
 }
 
@@ -77,6 +79,7 @@ impl Default for Theme {
                 accent_muted: 0x002b_4f8a,
                 footer: 0x000e_1114,
                 danger: 0x00ff_7b72,
+                warning: 0x00d2_9922,
                 success: 0x003f_b950,
             },
             // Starting metrics; the terminal view measures the font before resizing.
@@ -86,7 +89,7 @@ impl Default for Theme {
                 cell_width: 7.8,
                 cell_height: 18.,
             },
-            sidebar_width: 252.,
+            sidebar_width: 268.,
             pane_header_height: 32.,
             row_height: 28.,
             gutter: 8.,

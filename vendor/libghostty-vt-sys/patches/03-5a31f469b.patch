@@ -1,0 +1,1042 @@
+From 5a31f469b641d2b2107d5f147464417502134f54 Mon Sep 17 00:00:00 2001
+From: Mitchell Hashimoto <m@mitchellh.com>
+Date: Tue, 20 Oct 2026 20:45:03 -0700
+Subject: [PATCH] terminal: decode snapshot records from a header the caller
+ reads
+
+---
+ src/terminal/snapshot/checkpoint.zig   | 31 ++++++----
+ src/terminal/snapshot/continuation.zig | 71 ++++++++++++++++++-----
+ src/terminal/snapshot/history.zig      | 59 ++++++++++++++++---
+ src/terminal/snapshot/page.zig         | 78 ++++++++++++++++++++------
+ src/terminal/snapshot/record.zig       | 31 +++++++++-
+ src/terminal/snapshot/screen.zig       | 49 ++++++++++++++--
+ src/terminal/snapshot/snapshot.zig     | 26 +++++++--
+ src/terminal/snapshot/terminal.zig     | 27 +++++++--
+ 8 files changed, 305 insertions(+), 67 deletions(-)
+
+diff --git a/src/terminal/snapshot/checkpoint.zig b/src/terminal/snapshot/checkpoint.zig
+index 23ea755f8..9538f831e 100644
+--- a/src/terminal/snapshot/checkpoint.zig
++++ b/src/terminal/snapshot/checkpoint.zig
+@@ -36,20 +36,29 @@ pub fn encode(kind: Kind, stream: *record.Writer) EncodeError!void {
+     try stream.finish();
+ }
+ 
+-pub const DecodeError = record.Reader.InitError ||
+-    record.Reader.FinishError ||
++pub const DecodeError = record.Reader.FinishError ||
+     error{
+-        /// The next record is valid but is not the expected marker.
++        /// The record is valid but is not the expected marker.
+         UnexpectedRecordTag,
+     };
+ 
+-/// Decode one marker and require its payload to be empty.
++/// Decode one marker record of the given kind and require its payload to
++/// be empty.
++///
++/// `record_header` is the record's header, already read from `source`. A
++/// header for any other kind of record, including the other marker, returns
++/// `error.UnexpectedRecordTag`. See "Decoding Records" in `record.zig`.
++///
++/// ```zig
++/// try checkpoint.decode(.ready, source, try record.nextHeader(source));
++/// ```
+ pub fn decode(
+     kind: Kind,
+     source: *std.Io.Reader,
++    record_header: record.Header,
+ ) DecodeError!void {
+     var record_reader: record.Reader = undefined;
+-    try record_reader.init(source);
++    record_reader.initHeader(source, record_header);
+     if (record_reader.header.tag != kind.tag()) {
+         return error.UnexpectedRecordTag;
+     }
+@@ -84,7 +93,7 @@ test "READY golden encoding" {
+     // Decode the checked-in record rather than the generated candidate.
+     var source: std.Io.Reader = .fixed(&test_ready_fixture);
+     try source.discardAll(prefix.len);
+-    try decode(.ready, &source);
++    try decode(.ready, &source, try record.nextHeader(&source));
+ }
+ 
+ test "READY and FINISH are empty marker records" {
+@@ -116,9 +125,9 @@ test "READY and FINISH are empty marker records" {
+ 
+     var source: std.Io.Reader = .fixed(snapshot.written());
+     try source.discardAll(ready_offset);
+-    try decode(.ready, &source);
++    try decode(.ready, &source, try record.nextHeader(&source));
+     try source.discardAll("history".len);
+-    try decode(.finish, &source);
++    try decode(.finish, &source, try record.nextHeader(&source));
+ }
+ 
+ test "checkpoint rejects wrong tags and nonempty payloads" {
+@@ -136,7 +145,7 @@ test "checkpoint rejects wrong tags and nonempty payloads" {
+     var wrong_tag_source: std.Io.Reader = .fixed(snapshot.written());
+     try testing.expectError(
+         error.UnexpectedRecordTag,
+-        decode(.finish, &wrong_tag_source),
++        decode(.finish, &wrong_tag_source, try record.nextHeader(&wrong_tag_source)),
+     );
+ 
+     var invalid: std.Io.Writer.Allocating = .init(testing.allocator);
+@@ -154,7 +163,7 @@ test "checkpoint rejects wrong tags and nonempty payloads" {
+     var invalid_source: std.Io.Reader = .fixed(invalid.written());
+     try testing.expectError(
+         error.PayloadNotExhausted,
+-        decode(.ready, &invalid_source),
++        decode(.ready, &invalid_source, try record.nextHeader(&invalid_source)),
+     );
+ }
+ 
+@@ -172,6 +181,6 @@ test "FINISH leaves continuation bytes unread" {
+     try finished.writer.writeByte(0);
+ 
+     var source: std.Io.Reader = .fixed(finished.written());
+-    try decode(.finish, &source);
++    try decode(.finish, &source, try record.nextHeader(&source));
+     try testing.expectEqual(@as(u8, 0), try source.takeByte());
+ }
+diff --git a/src/terminal/snapshot/continuation.zig b/src/terminal/snapshot/continuation.zig
+index 8bc663fd5..697fc965f 100644
+--- a/src/terminal/snapshot/continuation.zig
++++ b/src/terminal/snapshot/continuation.zig
+@@ -61,11 +61,10 @@ pub fn encode(
+ 
+ pub const DecodeError = Allocator.Error ||
+     stream_continuation.ValidateError ||
+-    record.Reader.InitError ||
+     record.Reader.FinishError ||
+     std.Io.Reader.Error ||
+     error{
+-        /// The next record is valid but is not CONTINUATION.
++        /// The record is valid but is not CONTINUATION.
+         UnexpectedRecordTag,
+ 
+         /// The declared payload exceeds caller policy.
+@@ -74,16 +73,34 @@ pub const DecodeError = Allocator.Error ||
+ 
+ /// Decode and validate one CONTINUATION record.
+ ///
++/// `record_header` is the record's header, already read from `source`. A
++/// header for any other kind of record returns `error.UnexpectedRecordTag`.
++/// See "Decoding Records" in `record.zig`.
++///
+ /// A zero-length payload returns `ground` without allocating. A nonempty
+-/// payload returns allocator-owned bytes; although `Value.bytes` is a const
++/// payload returns allocator-owned bytes. Although `Value.bytes` is a const
+ /// slice, the caller must eventually free it with the same allocator.
++///
++/// ```zig
++/// const value = try continuation.decode(
++///     alloc,
++///     source,
++///     try record.nextHeader(source),
++///     max_bytes,
++/// );
++/// defer switch (value) {
++///     .ground => {},
++///     .bytes => |bytes| alloc.free(bytes),
++/// };
++/// ```
+ pub fn decode(
+     alloc: Allocator,
+     source: *std.Io.Reader,
++    record_header: record.Header,
+     max_bytes: usize,
+ ) DecodeError!Value {
+     var record_reader: record.Reader = undefined;
+-    try record_reader.init(source);
++    record_reader.initHeader(source, record_header);
+     if (record_reader.header.tag != .continuation) {
+         return error.UnexpectedRecordTag;
+     }
+@@ -217,7 +234,12 @@ test "empty continuation bytes encode and decode as ground" {
+     try testing.expectEqualStrings(&test_ground_fixture, encoded.written());
+ 
+     var source: std.Io.Reader = .fixed(encoded.written());
+-    const decoded = try decode(testing.allocator, &source, 0);
++    const decoded = try decode(
++        testing.allocator,
++        &source,
++        try record.nextHeader(&source),
++        0,
++    );
+     try testing.expect(decoded == .ground);
+ }
+ 
+@@ -257,7 +279,12 @@ test "continuation record round trip and cap" {
+         try encode(value, &stream);
+ 
+         var source: std.Io.Reader = .fixed(encoded.written());
+-        const decoded = try decode(testing.allocator, &source, 1024);
++        const decoded = try decode(
++            testing.allocator,
++            &source,
++            try record.nextHeader(&source),
++            1024,
++        );
+         defer switch (decoded) {
+             .ground => {},
+             .bytes => |bytes| testing.allocator.free(bytes),
+@@ -283,7 +310,12 @@ test "continuation record round trip and cap" {
+     });
+     try testing.expectError(
+         error.ContinuationLimitExceeded,
+-        decode(failing.allocator(), &capped_source, 3),
++        decode(
++            failing.allocator(),
++            &capped_source,
++            try record.nextHeader(&capped_source),
++            3,
++        ),
+     );
+     try testing.expectEqual(
+         @as(usize, record.Header.len),
+@@ -294,12 +326,15 @@ test "continuation record round trip and cap" {
+ test "continuation record rejects truncation, checksum, and tag" {
+     const testing = std.testing;
+ 
++    // A cut inside the header fails while reading the header, and a cut
++    // inside the payload fails while decoding it.
+     for (0..test_csi_fixture.len) |len| {
+         var source: std.Io.Reader = .fixed(test_csi_fixture[0..len]);
+-        try testing.expectError(
+-            error.EndOfStream,
+-            decode(testing.allocator, &source, 1024),
+-        );
++        const result = if (record.nextHeader(&source)) |header|
++            decode(testing.allocator, &source, header, 1024)
++        else |err|
++            err;
++        try testing.expectError(error.EndOfStream, result);
+     }
+ 
+     var invalid_checksum = test_csi_fixture;
+@@ -307,7 +342,12 @@ test "continuation record rejects truncation, checksum, and tag" {
+     var checksum_source: std.Io.Reader = .fixed(&invalid_checksum);
+     try testing.expectError(
+         error.InvalidChecksum,
+-        decode(testing.allocator, &checksum_source, 1024),
++        decode(
++            testing.allocator,
++            &checksum_source,
++            try record.nextHeader(&checksum_source),
++            1024,
++        ),
+     );
+ 
+     var wrong_tag = test_ground_fixture;
+@@ -315,6 +355,11 @@ test "continuation record rejects truncation, checksum, and tag" {
+     var tag_source: std.Io.Reader = .fixed(&wrong_tag);
+     try testing.expectError(
+         error.UnexpectedRecordTag,
+-        decode(testing.allocator, &tag_source, 1024),
++        decode(
++            testing.allocator,
++            &tag_source,
++            try record.nextHeader(&tag_source),
++            1024,
++        ),
+     );
+ }
+diff --git a/src/terminal/snapshot/history.zig b/src/terminal/snapshot/history.zig
+index b16ab9d35..414fd7538 100644
+--- a/src/terminal/snapshot/history.zig
++++ b/src/terminal/snapshot/history.zig
+@@ -217,8 +217,13 @@ pub const DecodePageError = Allocator.Error ||
+ ///
+ /// With `options.compress`, the page is compressed after it is added. A
+ /// page that cannot be compressed is kept uncompressed and is not an error.
++///
++/// `record_header` is the PAGE record's header, already read from `source`.
++/// A header for any other kind of record returns
++/// `error.UnexpectedRecordTag`. See "Decoding Records" in `record.zig`.
+ pub fn decodePage(
+     source: *std.Io.Reader,
++    record_header: record.Header,
+     alloc: Allocator,
+     terminal_screen: *TerminalScreen,
+     options: DecodeOptions,
+@@ -226,7 +231,7 @@ pub fn decodePage(
+     // PAGE exposes its exact capacity before decoding the payload, allowing
+     // the destination PageList to allocate the final backing memory once.
+     var decoder: page.Decoder = undefined;
+-    try decoder.init(source);
++    try decoder.init(source, record_header);
+     var allocation = try terminal_screen.pages.allocatePage(
+         decoder.capacity(),
+     );
+@@ -249,22 +254,32 @@ pub const Decoder = struct {
+     header: Header,
+ 
+     pub const InitError = Header.DecodeError ||
+-        record.Reader.InitError ||
+         record.Reader.FinishError ||
+         error{
+-            /// The next record is valid but is not a HISTORY.
++            /// The record is valid but is not a HISTORY.
+             UnexpectedRecordTag,
+         };
+ 
+-    pub const RestoreError = DecodePageError || error{
++    pub const RestoreError = DecodePageError || record.NextHeaderError || error{
+         /// The Screen already contains complete pages before its active page.
+         ExistingHistory,
+     };
+ 
+     /// Decode and finish the self-contained HISTORY manifest.
+-    pub fn init(self: *Decoder, source: *std.Io.Reader) InitError!void {
++    ///
++    /// `record_header` is the HISTORY record's header, already read from
++    /// `source`. A header for any other kind of record returns
++    /// `error.UnexpectedRecordTag`. See "Decoding Records" in `record.zig`.
++    ///
++    /// The PAGE records that follow are not read here. Restore them with
++    /// `decode`, or one at a time with `history.decodePage`.
++    pub fn init(
++        self: *Decoder,
++        source: *std.Io.Reader,
++        record_header: record.Header,
++    ) InitError!void {
+         var record_reader: record.Reader = undefined;
+-        try record_reader.init(source);
++        record_reader.initHeader(source, record_header);
+         if (record_reader.header.tag != .history) {
+             return error.UnexpectedRecordTag;
+         }
+@@ -292,6 +307,7 @@ pub const Decoder = struct {
+         for (0..self.header.page_count) |_| {
+             _ = try decodePage(
+                 self.source,
++                try record.nextHeader(self.source),
+                 alloc,
+                 terminal_screen,
+                 options,
+@@ -309,15 +325,32 @@ pub const Decoder = struct {
+ /// prepended only after its record and native integrity are validated. If a
+ /// later PAGE fails, earlier successful pages remain as a contiguous recent
+ /// history prefix.
++///
++/// `record_header` is the HISTORY record's header, already read from
++/// `source`. A header for any other kind of record returns
++/// `error.UnexpectedRecordTag`. This function reads the headers of the PAGE
++/// records that follow itself. See "Decoding Records" in `record.zig`.
++///
++/// ```zig
++/// try history.decode(
++///     source,
++///     try record.nextHeader(source),
++///     alloc,
++///     .primary,
++///     screen,
++///     .{},
++/// );
++/// ```
+ pub fn decode(
+     source: *std.Io.Reader,
++    record_header: record.Header,
+     alloc: Allocator,
+     expected_key: TerminalScreenKey,
+     terminal_screen: *TerminalScreen,
+     options: DecodeOptions,
+ ) DecodeError!void {
+     var decoder: Decoder = undefined;
+-    try decoder.init(source);
++    try decoder.init(source, record_header);
+     if (decoder.header.key != expected_key) return error.UnexpectedScreenKey;
+     try decoder.decode(alloc, terminal_screen, options);
+ }
+@@ -459,6 +492,7 @@ test "HISTORY encodes newest first and restores complete history" {
+ 
+     var decoded_newest = try page.decode(
+         &history_source,
++        try record.nextHeader(&history_source),
+         std.testing.allocator,
+     );
+     defer decoded_newest.deinit();
+@@ -468,6 +502,7 @@ test "HISTORY encodes newest first and restores complete history" {
+     );
+     var decoded_oldest = try page.decode(
+         &history_source,
++        try record.nextHeader(&history_source),
+         std.testing.allocator,
+     );
+     defer decoded_oldest.deinit();
+@@ -481,6 +516,7 @@ test "HISTORY encodes newest first and restores complete history" {
+     var restore_source: std.Io.Reader = .fixed(destination.written());
+     var decoded_screen = try screen.decode(
+         &restore_source,
++        try record.nextHeader(&restore_source),
+         std.testing.io,
+         std.testing.allocator,
+         .{
+@@ -502,6 +538,7 @@ test "HISTORY encodes newest first and restores complete history" {
+     try std.testing.expect(!restored.semantic_prompt.seen);
+     try decode(
+         &restore_source,
++        try record.nextHeader(&restore_source),
+         std.testing.allocator,
+         .primary,
+         restored,
+@@ -548,6 +585,7 @@ test "HISTORY encodes newest first and restores complete history" {
+     );
+     var decoded_truncated = try screen.decode(
+         &truncated_source,
++        try record.nextHeader(&truncated_source),
+         std.testing.io,
+         std.testing.allocator,
+         .{
+@@ -564,6 +602,7 @@ test "HISTORY encodes newest first and restores complete history" {
+         error.EndOfStream,
+         decode(
+             &truncated_source,
++            try record.nextHeader(&truncated_source),
+             std.testing.allocator,
+             .primary,
+             truncated,
+@@ -593,6 +632,7 @@ test "HISTORY encodes newest first and restores complete history" {
+     var partial_source: std.Io.Reader = .fixed(encoded);
+     var decoded_partial = try screen.decode(
+         &partial_source,
++        try record.nextHeader(&partial_source),
+         std.testing.io,
+         std.testing.allocator,
+         .{
+@@ -608,6 +648,7 @@ test "HISTORY encodes newest first and restores complete history" {
+         error.UnexpectedRecordTag,
+         decode(
+             &partial_source,
++            try record.nextHeader(&partial_source),
+             std.testing.allocator,
+             .primary,
+             partial,
+@@ -665,6 +706,7 @@ test "HISTORY decode compresses history pages when requested" {
+         var restore_source: std.Io.Reader = .fixed(destination.written());
+         var decoded_screen = try screen.decode(
+             &restore_source,
++            try record.nextHeader(&restore_source),
+             std.testing.io,
+             alloc,
+             screen_options,
+@@ -673,6 +715,7 @@ test "HISTORY decode compresses history pages when requested" {
+         const restored = &decoded_screen.screen;
+         try decode(
+             &restore_source,
++            try record.nextHeader(&restore_source),
+             alloc,
+             .primary,
+             restored,
+@@ -749,6 +792,7 @@ test "HISTORY encodes and restores an empty sequence" {
+     const initial_first = terminal_screen.pages.getTopLeft(.screen).node;
+     try decode(
+         &decode_source,
++        try record.nextHeader(&decode_source),
+         std.testing.allocator,
+         .primary,
+         &terminal_screen,
+@@ -819,6 +863,7 @@ test "HISTORY rejects invalid routing and incomplete sequences" {
+             case.expected,
+             decode(
+                 &source,
++                try record.nextHeader(&source),
+                 std.testing.allocator,
+                 .primary,
+                 &terminal_screen,
+diff --git a/src/terminal/snapshot/page.zig b/src/terminal/snapshot/page.zig
+index 41679c903..995d7d5d1 100644
+--- a/src/terminal/snapshot/page.zig
++++ b/src/terminal/snapshot/page.zig
+@@ -152,25 +152,34 @@ pub fn encode(
+ 
+ /// Errors possible while decoding and validating a complete PAGE record.
+ pub const DecodeError = PayloadDecodeError ||
+-    record.Reader.InitError ||
+     record.Reader.FinishError ||
+     TerminalPage.IntegrityError ||
+     error{
+-        /// The next record is valid but is not a PAGE.
++        /// The record is valid but is not a PAGE.
+         UnexpectedRecordTag,
+     };
+ 
+ /// Decode and validate one complete PAGE record into a fresh native page.
+ ///
++/// `record_header` is the record's header, already read from `reader`. A
++/// header for any other kind of record returns `error.UnexpectedRecordTag`.
++/// See "Decoding Records" in `record.zig`.
++///
+ /// The record tag, payload boundary, CRC32C, payload contents, and final page
+ /// integrity are all validated before the page is returned. `alloc` is used
+ /// only for temporary decode remaps and integrity-check storage.
++///
++/// ```zig
++/// var decoded = try page.decode(reader, try record.nextHeader(reader), alloc);
++/// defer decoded.deinit();
++/// ```
+ pub fn decode(
+     reader: *std.Io.Reader,
++    record_header: record.Header,
+     alloc: Allocator,
+ ) DecodeError!TerminalPage {
+     var decoder: Decoder = undefined;
+-    try decoder.init(reader);
++    try decoder.init(reader, record_header);
+ 
+     var page = TerminalPage.init(decoder.capacity()) catch
+         return error.OutOfMemory;
+@@ -190,8 +199,23 @@ pub const Decoder = struct {
+     /// Begin decoding one PAGE record and expose its required capacity.
+     /// After this, call `capacity` to get the capacity to allocate
+     /// the page properly, then `decode` into it.
+-    pub fn init(self: *Decoder, reader: *std.Io.Reader) DecodeError!void {
+-        try self.record_reader.init(reader);
++    ///
++    /// `record_header` is the record's header, already read from `reader`.
++    /// A header for any other kind of record returns
++    /// `error.UnexpectedRecordTag`. See "Decoding Records" in `record.zig`.
++    ///
++    /// ```zig
++    /// var decoder: page.Decoder = undefined;
++    /// try decoder.init(reader, try record.nextHeader(reader));
++    /// const native_page = try builder.allocatePage(decoder.capacity());
++    /// try decoder.decode(native_page, alloc);
++    /// ```
++    pub fn init(
++        self: *Decoder,
++        reader: *std.Io.Reader,
++        record_header: record.Header,
++    ) DecodeError!void {
++        self.record_reader.initHeader(reader, record_header);
+         if (self.record_reader.header.tag != .page) {
+             return error.UnexpectedRecordTag;
+         }
+@@ -289,22 +313,28 @@ pub const Decoder = struct {
+ };
+ 
+ /// Errors possible while discarding one PAGE record without decoding it.
+-pub const DiscardError = record.Reader.InitError ||
+-    record.Reader.FinishError ||
++pub const DiscardError = record.Reader.FinishError ||
+     std.Io.Reader.Error ||
+     error{
+-        /// The next record is valid but is not a PAGE.
++        /// The record is valid but is not a PAGE.
+         UnexpectedRecordTag,
+     };
+ 
+ /// Consume exactly one complete PAGE record, validating its framing and
+ /// CRC32C while discarding the payload without structural validation.
+ ///
++/// `record_header` is the record's header, already read from `source`. A
++/// header for any other kind of record returns `error.UnexpectedRecordTag`.
++/// See "Decoding Records" in `record.zig`.
++///
+ /// This lets a decoder stay aligned with the record sequence while dropping
+ /// page content it can no longer apply.
+-pub fn discard(source: *std.Io.Reader) DiscardError!void {
++pub fn discard(
++    source: *std.Io.Reader,
++    record_header: record.Header,
++) DiscardError!void {
+     var record_reader: record.Reader = undefined;
+-    try record_reader.init(source);
++    record_reader.initHeader(source, record_header);
+     if (record_reader.header.tag != .page) {
+         return error.UnexpectedRecordTag;
+     }
+@@ -904,7 +934,11 @@ test "framed PAGE golden empty record" {
+     );
+ 
+     var source: std.Io.Reader = .fixed(&test_empty_framed_page_fixture);
+-    var decoded = try decode(&source, std.testing.allocator);
++    var decoded = try decode(
++        &source,
++        try record.nextHeader(&source),
++        std.testing.allocator,
++    );
+     defer decoded.deinit();
+     try std.testing.expectEqual(
+         Header.init(&page),
+@@ -957,7 +991,7 @@ test "framed PAGE rejects a different record tag" {
+     var reader: std.Io.Reader = .fixed(&wrong_tag);
+     try std.testing.expectError(
+         error.UnexpectedRecordTag,
+-        decode(&reader, std.testing.allocator),
++        decode(&reader, try record.nextHeader(&reader), std.testing.allocator),
+     );
+ }
+ 
+@@ -965,7 +999,11 @@ test "framed PAGE preserves following bytes" {
+     var source: std.Io.Reader = .fixed(
+         test_empty_framed_page_fixture ++ "next",
+     );
+-    var decoded = try decode(&source, std.testing.allocator);
++    var decoded = try decode(
++        &source,
++        try record.nextHeader(&source),
++        std.testing.allocator,
++    );
+     defer decoded.deinit();
+     try std.testing.expectEqualStrings("next", try source.take(4));
+ }
+@@ -1772,7 +1810,7 @@ test "discard consumes exactly one PAGE record" {
+     try encoded.writer.writeAll("next");
+ 
+     var source: std.Io.Reader = .fixed(encoded.written());
+-    try discard(&source);
++    try discard(&source, try record.nextHeader(&source));
+     try testing.expectEqualStrings("next", try source.take(4));
+ 
+     // Only PAGE records may be discarded; the tag remains strict.
+@@ -1792,7 +1830,7 @@ test "discard consumes exactly one PAGE record" {
+     var wrong_tag_source: std.Io.Reader = .fixed(wrong_tag.written());
+     try testing.expectError(
+         error.UnexpectedRecordTag,
+-        discard(&wrong_tag_source),
++        discard(&wrong_tag_source, try record.nextHeader(&wrong_tag_source)),
+     );
+ 
+     // Discarded bytes are still covered by the record CRC.
+@@ -1803,13 +1841,19 @@ test "discard consumes exactly one PAGE record" {
+     defer testing.allocator.free(corrupted);
+     corrupted[corrupted.len - 1] ^= 1;
+     var corrupted_source: std.Io.Reader = .fixed(corrupted);
+-    try testing.expectError(error.InvalidChecksum, discard(&corrupted_source));
++    try testing.expectError(
++        error.InvalidChecksum,
++        discard(&corrupted_source, try record.nextHeader(&corrupted_source)),
++    );
+ 
+     // A truncated payload is detected before `finish`.
+     var truncated_source: std.Io.Reader = .fixed(
+         encoded.written()[0 .. record_len - 1],
+     );
+-    try testing.expectError(error.EndOfStream, discard(&truncated_source));
++    try testing.expectError(
++        error.EndOfStream,
++        discard(&truncated_source, try record.nextHeader(&truncated_source)),
++    );
+ }
+ 
+ test "decode ignores empty hyperlink strings" {
+diff --git a/src/terminal/snapshot/record.zig b/src/terminal/snapshot/record.zig
+index fd83e2287..f587ae6a6 100644
+--- a/src/terminal/snapshot/record.zig
++++ b/src/terminal/snapshot/record.zig
+@@ -43,8 +43,35 @@
+ //! needs a new snapshot version instead.
+ //!
+ //! You rarely need to think about this when writing a record decoder.
+-//! `Reader.init` reads headers with `nextHeader`, which does the skipping,
+-//! so every decoder built on `Reader` skips unknown records automatically.
++//! `nextHeader` does the skipping, and every header is read through it.
++//!
++//! ## Decoding Records
++//!
++//! Decoding a record is a two-step job. The caller reads the record's
++//! header with `nextHeader`, then passes that header to the decoder for the
++//! record, such as `screen.decode` or `checkpoint.decode`. The decoder reads
++//! the payload that follows from the same source.
++//!
++//! ```zig
++//! // Read the header, skipping any unknown records before it.
++//! const header = try record.nextHeader(source);
++//!
++//! // Decode the record it belongs to.
++//! try checkpoint.decode(.ready, source, header);
++//! ```
++//!
++//! Splitting the work this way lets the caller look at the tag first. A
++//! caller that accepts several kinds of records in one position reads the
++//! header, switches on `header.tag`, and calls the matching decoder.
++//!
++//! A caller that expects exactly one kind of record can pass the header
++//! along without checking it. Every decoder checks the tag itself and
++//! returns `error.UnexpectedRecordTag` for a header of any other kind, so
++//! that check lives in one place.
++//!
++//! Decoders that are followed by a sequence of records, such as a SCREEN
++//! and its PAGE records, read the headers of the records in that sequence
++//! themselves. Only the first header comes from the caller.
+ 
+ const std = @import("std");
+ const assert = std.debug.assert;
+diff --git a/src/terminal/snapshot/screen.zig b/src/terminal/snapshot/screen.zig
+index 1b2b7eda3..8d5076298 100644
+--- a/src/terminal/snapshot/screen.zig
++++ b/src/terminal/snapshot/screen.zig
+@@ -287,12 +287,12 @@ pub fn encode(
+ /// Errors possible while restoring a SCREEN and its declared PAGE sequence.
+ pub const DecodeError = PayloadDecodeError ||
+     page.DecodeError ||
+-    record.Reader.InitError ||
++    record.NextHeaderError ||
+     record.Reader.FinishError ||
+     TerminalPageList.Builder.FinishError ||
+     TerminalPageList.IncreaseCapacityError ||
+     error{
+-        /// The next record is valid but is not a SCREEN.
++        /// The record is valid but is not a SCREEN.
+         UnexpectedRecordTag,
+ 
+         /// A SCREEN must declare at least one PAGE.
+@@ -319,8 +319,25 @@ pub const Decoded = struct {
+ /// is decoded transactionally: on failure, all page, pin, hyperlink, and
+ /// temporary allocations are released and no partially restored Screen escapes.
+ /// The returned key selects the ScreenSet slot that owns the decoded screen.
++///
++/// `record_header` is the SCREEN record's header, already read from
++/// `source`. A header for any other kind of record returns
++/// `error.UnexpectedRecordTag`. This function reads the headers of the PAGE
++/// records that follow itself. See "Decoding Records" in `record.zig`.
++///
++/// ```zig
++/// var decoded = try screen.decode(
++///     source,
++///     try record.nextHeader(source),
++///     io,
++///     alloc,
++///     options,
++/// );
++/// defer decoded.deinit();
++/// ```
+ pub fn decode(
+     source: *std.Io.Reader,
++    record_header: record.Header,
+     io_: std.Io,
+     alloc: Allocator,
+     options: TerminalScreen.Options,
+@@ -328,7 +345,7 @@ pub fn decode(
+     // Decode and finish the self-contained SCREEN record before consuming any
+     // of the PAGE records which follow it.
+     var record_reader: record.Reader = undefined;
+-    try record_reader.init(source);
++    record_reader.initHeader(source, record_header);
+     if (record_reader.header.tag != .screen) {
+         return error.UnexpectedRecordTag;
+     }
+@@ -380,7 +397,7 @@ pub fn decode(
+         // builder-owned storage, avoiding an intermediate page representation.
+         for (0..header.page_count) |_| {
+             var decoder: page.Decoder = undefined;
+-            try decoder.init(source);
++            try decoder.init(source, try record.nextHeader(source));
+             const native_page = try builder.allocatePage(decoder.capacity());
+             try decoder.decode(native_page, alloc);
+         }
+@@ -1747,6 +1764,7 @@ test "framed native SCREEN and PAGE sequence" {
+     var restore_source: std.Io.Reader = .fixed(destination.written()[6..]);
+     var decoded = try decode(
+         &restore_source,
++        try record.nextHeader(&restore_source),
+         std.testing.io,
+         std.testing.allocator,
+         .{ .cols = 8, .rows = 8, .max_scrollback_bytes = 0 },
+@@ -1906,14 +1924,22 @@ test "SCREEN encodes the minimal complete-page active suffix" {
+     );
+     try screen_record.finish();
+ 
+-    var decoded_mixed = try page.decode(&source, std.testing.allocator);
++    var decoded_mixed = try page.decode(
++        &source,
++        try record.nextHeader(&source),
++        std.testing.allocator,
++    );
+     defer decoded_mixed.deinit();
+     try std.testing.expectEqual(
+         @as(u21, 'B'),
+         decoded_mixed.getRowAndCell(0, 0).cell.codepoint(),
+     );
+ 
+-    var decoded_newest = try page.decode(&source, std.testing.allocator);
++    var decoded_newest = try page.decode(
++        &source,
++        try record.nextHeader(&source),
++        std.testing.allocator,
++    );
+     defer decoded_newest.deinit();
+     try std.testing.expectEqual(
+         @as(u21, 'C'),
+@@ -1926,6 +1952,7 @@ test "SCREEN encodes the minimal complete-page active suffix" {
+     var restore_source: std.Io.Reader = .fixed(destination.written());
+     var decoded = try decode(
+         &restore_source,
++        try record.nextHeader(&restore_source),
+         std.testing.io,
+         std.testing.allocator,
+         .{
+@@ -2015,6 +2042,7 @@ test "SCREEN encoding preserves a compressed suffix page" {
+     var source: std.Io.Reader = .fixed(destination.written());
+     var decoded = try decode(
+         &source,
++        try record.nextHeader(&source),
+         testing.io,
+         testing.allocator,
+         .{ .cols = 8, .rows = 2, .max_scrollback_bytes = 0 },
+@@ -2095,6 +2123,7 @@ test "SCREEN restoration normalizes invalid cursor positions" {
+         var source: std.Io.Reader = .fixed(destination.written());
+         var decoded = try decode(
+             &source,
++            try record.nextHeader(&source),
+             std.testing.io,
+             std.testing.allocator,
+             .{ .cols = 2, .rows = 2, .max_scrollback_bytes = 0 },
+@@ -2151,6 +2180,7 @@ test "SCREEN validates pending wrap against a mixed-width cursor page" {
+     var source: std.Io.Reader = .fixed(destination.written());
+     var decoded = try decode(
+         &source,
++        try record.nextHeader(&source),
+         std.testing.io,
+         std.testing.allocator,
+         .{ .cols = 8, .rows = 1, .max_scrollback_bytes = 0 },
+@@ -2202,6 +2232,7 @@ test "SCREEN clamps a decoded saved cursor to terminal dimensions" {
+     var source: std.Io.Reader = .fixed(destination.written());
+     var decoded = try decode(
+         &source,
++        try record.nextHeader(&source),
+         std.testing.io,
+         std.testing.allocator,
+         .{ .cols = 2, .rows = 2, .max_scrollback_bytes = 0 },
+@@ -2239,8 +2270,10 @@ test "SCREEN restoration rejects invalid and incomplete sequences" {
+         var source: std.Io.Reader = .fixed(
+             destination.written()[0..fixture_len],
+         );
++        const header = record.nextHeader(&source) catch continue;
+         var restored = decode(
+             &source,
++            header,
+             std.testing.io,
+             std.testing.allocator,
+             .{ .cols = 2, .rows = 2, .max_scrollback_bytes = 0 },
+@@ -2260,6 +2293,7 @@ test "SCREEN restoration rejects invalid and incomplete sequences" {
+             error.OutOfMemory,
+             decode(
+                 &source,
++                try record.nextHeader(&source),
+                 std.testing.io,
+                 failing.allocator(),
+                 .{ .cols = 2, .rows = 2, .max_scrollback_bytes = 0 },
+@@ -2291,6 +2325,7 @@ test "SCREEN restoration rejects invalid and incomplete sequences" {
+         error.InvalidPageCount,
+         decode(
+             &empty_source,
++            try record.nextHeader(&empty_source),
+             std.testing.io,
+             std.testing.allocator,
+             .{ .cols = 2, .rows = 2, .max_scrollback_bytes = 0 },
+@@ -2371,6 +2406,7 @@ test "SCREEN decode ignores an invalid cursor hyperlink" {
+     var source: std.Io.Reader = .fixed(destination.written());
+     var decoded = try decode(
+         &source,
++        try record.nextHeader(&source),
+         std.testing.io,
+         std.testing.allocator,
+         .{ .cols = 1, .rows = 1 },
+@@ -2441,6 +2477,7 @@ test "SCREEN decode ignores a PAGE with an empty hyperlink URI" {
+     var source: std.Io.Reader = .fixed(destination.written());
+     var decoded = try decode(
+         &source,
++        try record.nextHeader(&source),
+         std.testing.io,
+         std.testing.allocator,
+         .{ .cols = 1, .rows = 1 },
+diff --git a/src/terminal/snapshot/snapshot.zig b/src/terminal/snapshot/snapshot.zig
+index 70de2908f..5c3d83719 100644
+--- a/src/terminal/snapshot/snapshot.zig
++++ b/src/terminal/snapshot/snapshot.zig
+@@ -322,7 +322,12 @@ pub const Decoder = struct {
+         // screen slots with their final routing. SCREEN values replace those
+         // slots in place so ScreenSet pointers, including the active
+         // pointer, stay valid.
+-        var result = try terminal.decode(reader, io_, alloc);
++        var result = try terminal.decode(
++            reader,
++            try record.nextHeader(reader),
++            io_,
++            alloc,
++        );
+         errdefer result.deinit(alloc);
+ 
+         // TERMINAL initializes exactly the number of screen slots it
+@@ -352,6 +357,7 @@ pub const Decoder = struct {
+         for (0..screen_count) |_| {
+             var decoded = try screen.decode(
+                 reader,
++                try record.nextHeader(reader),
+                 io_,
+                 alloc,
+                 screen_options,
+@@ -374,6 +380,7 @@ pub const Decoder = struct {
+         const decoded_continuation = try continuation.decode(
+             alloc,
+             reader,
++            try record.nextHeader(reader),
+             options.max_continuation_bytes,
+         );
+         errdefer switch (decoded_continuation) {
+@@ -382,7 +389,7 @@ pub const Decoder = struct {
+         };
+ 
+         // READY marks the exact envelope-through-CONTINUATION boundary.
+-        try checkpoint.decode(.ready, self.source);
++        try checkpoint.decode(.ready, reader, try record.nextHeader(reader));
+ 
+         // Record where history may be applied. The declared keys route the
+         // HISTORY sequences, and the generations detect declared screens
+@@ -424,7 +431,8 @@ pub const Decoder = struct {
+     };
+ 
+     /// Errors possible while decoding history records through FINISH.
+-    pub const NextError = checkpoint.DecodeError ||
++    pub const NextError = record.NextHeaderError ||
++        checkpoint.DecodeError ||
+         history.Decoder.InitError ||
+         page.DiscardError ||
+         page.DecodeError ||
+@@ -499,10 +507,14 @@ pub const Decoder = struct {
+                 state.current = null;
+             }
+ 
++            // Read the next header before deciding how to decode the
++            // record. Unknown records before it were skipped.
++            const header = try record.nextHeader(self.source);
++
+             // All sequences are consumed: FINISH ends the snapshot, leaving
+             // trailing transport bytes unread.
+             if (state.pending == 0) {
+-                try checkpoint.decode(.finish, self.source);
++                try checkpoint.decode(.finish, self.source, header);
+                 if (comptime build_options.slow_runtime_safety) {
+                     var it = state.generations.iterator();
+                     while (it.next()) |entry| {
+@@ -521,7 +533,7 @@ pub const Decoder = struct {
+             // may not repeat.
+             state.pending -= 1;
+             var manifest: history.Decoder = undefined;
+-            try manifest.init(self.source);
++            try manifest.init(self.source, header);
+             const key = manifest.header.key;
+             if (state.generations.get(key) == null) {
+                 return error.UnexpectedHistoryKey;
+@@ -563,12 +575,13 @@ pub const Decoder = struct {
+         };
+ 
+         sequence.remaining -= 1;
++        const header = try record.nextHeader(self.source);
+         const rows: usize = rows: {
+             const restored = destination orelse {
+                 // The record must still be consumed so decoding remains
+                 // aligned with the following records and FINISH marker.
+                 sequence.apply = false;
+-                try page.discard(self.source);
++                try page.discard(self.source, header);
+                 break :rows 0;
+             };
+             // The one-shot history decoder rejects a Screen which already has
+@@ -579,6 +592,7 @@ pub const Decoder = struct {
+             // its current scrollback limits.
+             break :rows history.decodePage(
+                 self.source,
++                header,
+                 alloc,
+                 restored,
+                 state.page_options,
+diff --git a/src/terminal/snapshot/terminal.zig b/src/terminal/snapshot/terminal.zig
+index 48cf1e9dd..3bfb57528 100644
+--- a/src/terminal/snapshot/terminal.zig
++++ b/src/terminal/snapshot/terminal.zig
+@@ -935,10 +935,9 @@ pub fn encode(
+ 
+ /// Errors possible while decoding one native TERMINAL record.
+ pub const DecodeError = PayloadDecodeError ||
+-    record.Reader.InitError ||
+     record.Reader.FinishError ||
+     error{
+-        /// The next record is valid but is not a TERMINAL.
++        /// The record is valid but is not a TERMINAL.
+         UnexpectedRecordTag,
+     };
+ 
+@@ -948,15 +947,19 @@ pub const DecodeError = PayloadDecodeError ||
+ /// primary and optional alternate screens with the declared routing. Later
+ /// SCREEN records replace those screens in place. On failure, all decoded and
+ /// partially initialized native state is released.
++///
++/// `record_header` is the record's header, already read from `source`. See
++/// "Decoding Records" in `record.zig`.
+ pub fn decode(
+     source: *std.Io.Reader,
++    record_header: record.Header,
+     io_: std.Io,
+     alloc: Allocator,
+ ) DecodeError!Terminal {
+     // Finish the complete record before constructing native terminal state.
+     var payload: DecodedPayload = payload: {
+         var record_reader: record.Reader = undefined;
+-        try record_reader.init(source);
++        record_reader.initHeader(source, record_header);
+         if (record_reader.header.tag != .terminal) {
+             return error.UnexpectedRecordTag;
+         }
+@@ -1657,6 +1660,7 @@ test "TERMINAL record encodes native terminal state" {
+     var source: std.Io.Reader = .fixed(destination.written());
+     var restored = try decode(
+         &source,
++        try record.nextHeader(&source),
+         testing.io,
+         testing.allocator,
+     );
+@@ -1738,6 +1742,7 @@ test "TERMINAL record declares an initialized alternate screen" {
+     var source: std.Io.Reader = .fixed(destination.written());
+     var restored = try decode(
+         &source,
++        try record.nextHeader(&source),
+         testing.io,
+         testing.allocator,
+     );
+@@ -1803,7 +1808,12 @@ test "TERMINAL record decoding rejects malformed input transactionally" {
+     var wrong_tag_source: std.Io.Reader = .fixed(wrong_tag.written());
+     try testing.expectError(
+         error.UnexpectedRecordTag,
+-        decode(&wrong_tag_source, testing.io, testing.allocator),
++        decode(
++            &wrong_tag_source,
++            try record.nextHeader(&wrong_tag_source),
++            testing.io,
++            testing.allocator,
++        ),
+     );
+ 
+     // Build one canonical record for exhaustive truncation and allocation
+@@ -1829,8 +1839,10 @@ test "TERMINAL record decoding rejects malformed input transactionally" {
+         var source: std.Io.Reader = .fixed(
+             encoded.written()[0..fixture_len],
+         );
++        const header = record.nextHeader(&source) catch continue;
+         var restored = decode(
+             &source,
++            header,
+             testing.io,
+             testing.allocator,
+         ) catch continue;
+@@ -1845,6 +1857,11 @@ test "TERMINAL record decoding rejects malformed input transactionally" {
+     var failing_source: std.Io.Reader = .fixed(encoded.written());
+     try testing.expectError(
+         error.OutOfMemory,
+-        decode(&failing_source, testing.io, failing.allocator()),
++        decode(
++            &failing_source,
++            try record.nextHeader(&failing_source),
++            testing.io,
++            failing.allocator(),
++        ),
+     );
+ }
+-- 
+2.56.0
+

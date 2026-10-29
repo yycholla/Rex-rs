@@ -218,6 +218,8 @@ impl PaneUpdate {
             .map(|row| row.context("incomplete pane reset"))
             .collect();
         let frame = TerminalFrame {
+            images: Arc::default(),
+            graphics_warning: None,
             size: self.size,
             cursor: self.cursor,
             rows: rows?,
@@ -350,6 +352,8 @@ mod tests {
             .unwrap();
         let id = state.pane_ids()[0];
         let frame = TerminalFrame {
+            images: Arc::default(),
+            graphics_warning: None,
             size: GridSize::new(80, 24).unwrap(),
             rows: (0..24)
                 .map(|_| {

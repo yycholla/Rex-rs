@@ -20,7 +20,7 @@ use std::{
     fs,
     future::Future,
     io::{Read, Write},
-    net::Shutdown,
+    net::{Shutdown, TcpListener},
     os::unix::{
         fs::DirBuilderExt,
         net::{UnixListener, UnixStream},
@@ -54,6 +54,15 @@ mod fidelity;
 #[path = "rex-native-smoke/search.rs"]
 mod search;
 
+#[path = "rex-native-smoke/pending.rs"]
+mod pending;
+
+#[path = "rex-native-smoke/network.rs"]
+mod network;
+
+#[path = "rex-native-smoke/routing.rs"]
+mod routing;
+
 const FIXTURE_CONFIG: &str = r#"-- Isolated interoperability fixture.
 rex.action{
   name = "smoke_queue_pair",
@@ -63,6 +72,49 @@ rex.action{
     rex.client.queue("client.font.increase")
     rex.client.queue("client.sidebar.toggle")
     return { applied = true }
+  end,
+}
+rex.action{
+  name = "smoke_nested_copy",
+  title = "Smoke Nested Copy",
+  run = function(ctx, args)
+    local result, err = rex.call("client.perform", {
+      client_id = ctx.client_id, action = "client.copy", args = {},
+      session_id = ctx.session_id, block_id = ctx.block_id, timeout_ms = 5000
+    })
+    if err ~= nil then error(err, 0) end
+    return result
+  end,
+}
+rex.action{
+  name = "smoke_nested_split", title = "Smoke Nested Split",
+  run = function(ctx, args)
+    local result, err = rex.call("client.perform", {
+      client_id=ctx.client_id, action="pane.split", args={direction="right"},
+      session_id=ctx.session_id, block_id=ctx.block_id, timeout_ms=5000})
+    if err ~= nil then error(err, 0) end
+    return result
+  end,
+}
+rex.action{
+  name = "smoke_cross_server", title = "Smoke Cross Server",
+  run = function(ctx, args)
+    local result, err = rex.server(args.peer).call(args.method, args.payload)
+    if err ~= nil then error(err, 0) end
+    return result
+  end,
+}
+rex.action{
+  name = "smoke_cross_after_copy", title = "Smoke Stale Cross Server",
+  run = function(ctx, args)
+    local remote = rex.server(args.peer)
+    local copied, err = rex.call("client.perform", {client_id=ctx.client_id,
+      action="client.copy", args={}, timeout_ms=5000})
+    if err ~= nil then error(err, 0) end
+    local result, failed = remote.call("session.set_label", {
+      session_id=args.session_id, label="Stale route mutated"})
+    if failed ~= nil then error(failed, 0) end
+    return result
   end,
 }
 "#;
@@ -84,6 +136,10 @@ fn main() -> Result<()> {
         .context("native local history search and selection")?;
     fidelity::check(&mut actions, &fixture.endpoint)
         .context("native terminal presentation fidelity")?;
+    pending::check(&mut actions, &fixture.endpoint).context("pending Lua worker responsiveness")?;
+    network::check(&fixture.network_endpoint)
+        .context("native HTTP control and terminal transport")?;
+    routing::check(&fixture.endpoint).context("named cross-server Lua routing")?;
     fixture.stop()?;
     println!(
         "PASS: native Rex bootstrap, ordered commands/events, terminal snapshot/Unicode/resume, normal shell exit, ownership and detached process lifetime"
@@ -94,6 +150,7 @@ fn main() -> Result<()> {
 struct ServerFixture {
     directory: PathBuf,
     endpoint: String,
+    network_endpoint: String,
     child: Option<Child>,
 }
 
@@ -107,12 +164,16 @@ impl ServerFixture {
         fs::DirBuilder::new().mode(0o700).create(&directory)?;
         fs::write(directory.join("init.lua"), FIXTURE_CONFIG)?;
         let endpoint = format!("unix://{}", directory.join("server.sock").display());
+        let reservation = TcpListener::bind(("127.0.0.1", 0))?;
+        let network_endpoint = format!("http://{}", reservation.local_addr()?);
         let log = fs::File::create(directory.join("server.log"))?;
         let mut fixture = Self {
             directory,
             endpoint,
+            network_endpoint,
             child: None,
         };
+        drop(reservation);
         fixture.child = Some(
             ProcessCommand::new("rex")
                 .args([
@@ -125,7 +186,13 @@ impl ServerFixture {
                 .arg(fixture.directory.join("state"))
                 .arg("--config")
                 .arg(fixture.directory.join("init.lua"))
-                .args(["--log-format", "json"])
+                .args([
+                    "--log-format",
+                    "json",
+                    "--extra-listen",
+                    &fixture.network_endpoint,
+                    "--allow-anonymous",
+                ])
                 .env("SHELL", "/bin/sh")
                 .stdin(Stdio::null())
                 .stdout(log.try_clone()?)
@@ -755,6 +822,7 @@ fn check_cached_client(
     client.send_key(
         pane,
         &KeyInput {
+            physical_key: None,
             key: "enter".into(),
             text: None,
             modifiers: Modifiers::default(),
@@ -768,6 +836,7 @@ fn check_cached_client(
     client.send_key(
         pane,
         &KeyInput {
+            physical_key: None,
             key: "enter".into(),
             text: None,
             modifiers: Modifiers::default(),
@@ -2162,6 +2231,8 @@ fn check_action_registration(
         "client.find.toggle",
         "client.find.next",
         "client.find.previous",
+        "client.palette.toggle",
+        "client.quit",
     ];
     ensure!(
         offered.len() == expected.len(),
@@ -2765,6 +2836,7 @@ fn load_client_script(client: &mut WorkspaceClient, source: &str) -> Result<Valu
 
 fn script_key(name: &str, control: bool) -> KeyInput {
     KeyInput {
+        physical_key: None,
         key: name.into(),
         text: Some(name.into()),
         modifiers: Modifiers {

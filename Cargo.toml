@@ -38,6 +38,7 @@ opt-level = 2
 [dependencies]
 anyhow = { version = "1", optional = true }
 gpui = { version = "=0.2.2", optional = true }
+image = { version = "=0.25.10", default-features = false, optional = true }
 # Rex terminal streams begin with a Ghostty snapshot; the released wrapper lacks
 # the decoder. Pin the snapshot-capable wrapper rather than following its branch.
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "9ede35b8ea94a55ed3608408d67e102883129f1e", optional = true }
@@ -48,11 +49,14 @@ unicode-segmentation = { version = "1", optional = true }
 serde = { version = "1", features = ["derive", "rc"], optional = true }
 serde_json = { version = "1", optional = true }
 tungstenite = { version = "0.28", optional = true }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "=0.8.5", optional = true }
+url = { version = "=2.5.8", optional = true }
 
 [features]
 default = ["desktop"]
-ghostty = ["dep:anyhow", "dep:libghostty-vt", "dep:portable-pty", "dep:nix", "dep:serde", "dep:serde_json", "dep:tungstenite"]
-desktop = ["ghostty", "dep:gpui", "dep:unicode-segmentation"]
+ghostty = ["dep:anyhow", "dep:libghostty-vt", "dep:portable-pty", "dep:nix", "dep:serde", "dep:serde_json", "dep:tungstenite", "dep:rustls", "dep:rustls-native-certs", "dep:url"]
+desktop = ["ghostty", "dep:gpui", "dep:unicode-segmentation", "dep:image"]
 
 [[bin]]
 name = "rex-rs"
@@ -126,3 +130,11 @@ todo = "warn"
 panic = "warn"
 dbg_macro = "warn"
 unimplemented = "warn"
+
+# Preserve Linux native key identity for Rex physical bindings.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
+
+# Backport snapshot image records and static PNG decoding; retain the wrapper pin.
+[patch."https://github.com/Uzaaft/libghostty-rs"]
+libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }

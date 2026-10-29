@@ -1,4 +1,6 @@
+mod graphics;
 mod interaction;
+mod links;
 use crate::core::{
     GridSize,
     frame::{Cell, CellStyle, CellWidth, Cursor, CursorStyle, Rgb, TerminalFrame, UnderlineKind},
@@ -15,7 +17,7 @@ use libghostty_vt::{
     style::{RgbColor, StyleColor, Underline},
     terminal::{Mode, ScrollViewport},
 };
-use std::{borrow::Cow, cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 #[derive(Clone, Copy, Debug)]
 pub struct TerminalConfig {
@@ -50,6 +52,7 @@ pub struct GhosttyTerminal {
     cached_colors: Option<Colors>,
     cached_rows: HashMap<RowId, Arc<Vec<Cell>>>,
     interaction: interaction::Interaction,
+    graphics: graphics::GraphicsState,
 }
 
 impl Drop for GhosttyTerminal {
@@ -92,6 +95,32 @@ fn snapshot_cell(
             overline: style.overline,
         },
     })
+}
+
+fn snapshot_row<'alloc>(
+    row: &libghostty_vt::render::RowIteration<'alloc, '_>,
+    iterator: &mut CellIterator<'alloc>,
+    grapheme: &mut String,
+    colors: &Colors,
+    previous: Option<&Arc<Vec<Cell>>>,
+    columns: u16,
+) -> Result<Arc<Vec<Cell>>> {
+    let mut cells = Vec::with_capacity(usize::from(columns));
+    let mut iterator = iterator.update(row)?;
+    while let Some(cell) = iterator.next() {
+        cells.push(snapshot_cell(
+            cell,
+            grapheme,
+            from_ghostty(colors.foreground),
+            from_ghostty(colors.background),
+            &colors.palette,
+        )?);
+    }
+    // Native cursor rows can be dirty without any cell changes. Reuse their
+    // owned identity so cursor/image redraws preserve shaped glyph caches.
+    Ok(previous
+        .filter(|previous| previous.as_ref() == &cells)
+        .map_or_else(|| Arc::new(cells), Arc::clone))
 }
 
 fn underline_kind(underline: Underline) -> Result<UnderlineKind> {
@@ -154,9 +183,8 @@ const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Compatibility with the optional records in Ghostty's version-1 format.
 /// Known records remain byte-for-byte unchanged and the native decoder still
-/// validates their checksums, ordering and counts. Graphics cannot be rendered
-/// by this client's owned text-cell frame format.
-fn normalize_snapshot(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
+/// validates their checksums, ordering and counts, including graphics payloads.
+fn normalize_snapshot(bytes: &[u8]) -> Result<&[u8]> {
     ensure!(
         bytes.len() <= MAX_SNAPSHOT_BYTES,
         "Ghostty snapshot exceeds size limit"
@@ -169,7 +197,6 @@ fn normalize_snapshot(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
         u16::from_le_bytes([bytes[8], bytes[9]]) == 1,
         "unsupported Ghostty snapshot version"
     );
-    let mut output = None::<Vec<u8>>;
     let mut offset = 10;
     let mut finished = false;
     while offset < bytes.len() {
@@ -191,22 +218,13 @@ fn normalize_snapshot(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
             "truncated Ghostty snapshot record payload"
         );
         match tag {
-            1..=7 => {
-                if let Some(output) = &mut output {
-                    output.extend_from_slice(&bytes[offset..end]);
-                }
-            }
+            1..=7 => {}
             8..=10 => {
                 let expected = u32::from_le_bytes([header[6], header[7], header[8], header[9]]);
                 ensure!(
                     snapshot_crc32c(&header[..6], &bytes[offset + 10..end]) == expected,
                     "optional Ghostty snapshot record checksum mismatch"
                 );
-                if output.is_none() {
-                    let mut filtered = Vec::with_capacity(bytes.len());
-                    filtered.extend_from_slice(&bytes[..offset]);
-                    output = Some(filtered);
-                }
             }
             _ => anyhow::bail!("unsupported Ghostty snapshot record tag {tag}"),
         }
@@ -219,7 +237,7 @@ fn normalize_snapshot(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
         }
     }
     ensure!(finished, "Ghostty snapshot lacks FINISH marker");
-    Ok(output.map_or(Cow::Borrowed(bytes), Cow::Owned))
+    Ok(bytes)
 }
 
 const fn crc32c_table() -> [u32; 256] {
@@ -281,11 +299,10 @@ impl GhosttyTerminal {
             bytes.len() <= MAX_SNAPSHOT_BYTES,
             "Ghostty snapshot exceeds 64 MiB limit"
         );
-        // Newer version-1 encoders add optional Kitty graphics records. The
-        // pinned decoder predates those tags; the text renderer can omit them
-        // after validating their complete framing and CRC32C.
+        // The recorded native compatibility patch decodes Kitty graphics records
+        // without changing the snapshot version or replaying process side effects.
         let bytes = normalize_snapshot(bytes)?;
-        let decoder = Decoder::new_buf(&bytes).context("initialize Ghostty snapshot decoder")?;
+        let decoder = Decoder::new_buf(bytes).context("initialize Ghostty snapshot decoder")?;
         let terminal = decoder.decode().context("decode Rex Ghostty snapshot")?;
         let size = GridSize::new(terminal.cols()?, terminal.rows()?)?;
         ensure!(
@@ -300,6 +317,12 @@ impl GhosttyTerminal {
         size: GridSize,
         respond: bool,
     ) -> Result<Self> {
+        terminal.set_kitty_image_storage_limit(u64::try_from(graphics::IMAGE_BYTES)?)?;
+        // Remote terminal output may carry only direct pixel data, never paths or
+        // shared-memory references resolved on this desktop's machine.
+        terminal.set_kitty_image_from_file_allowed(false)?;
+        terminal.set_kitty_image_from_shared_mem_allowed(false)?;
+        terminal.set_kitty_image_temp_file_dir(None)?;
         let pending_output = Rc::new(RefCell::new(Vec::new()));
         if respond {
             let output = Rc::clone(&pending_output);
@@ -320,6 +343,7 @@ impl GhosttyTerminal {
             cached_colors: None,
             cached_rows: HashMap::new(),
             interaction: interaction::Interaction::new()?,
+            graphics: graphics::GraphicsState::new()?,
         })
     }
 
@@ -332,6 +356,7 @@ impl GhosttyTerminal {
 
     pub fn feed(&mut self, bytes: &[u8]) {
         self.terminal.vt_write(bytes);
+        self.graphics.needs_tick = true;
         self.interaction.mutated();
     }
 
@@ -511,6 +536,9 @@ impl GhosttyTerminal {
         let previous = self.cached_frame.take();
         let snapshot = self.render_state.update(&self.terminal)?;
         let dirty = snapshot.dirty()?;
+        self.graphics.refresh(&self.terminal, &snapshot, self.size);
+        let images = Arc::clone(&self.graphics.images);
+        let graphics_warning = self.graphics.warning.clone();
         let colors = snapshot.colors()?;
         let foreground = from_ghostty(colors.foreground);
         let background = from_ghostty(colors.background);
@@ -523,10 +551,13 @@ impl GhosttyTerminal {
                 .as_ref()
                 .is_none_or(|frame| frame.size != self.size)
             || !cell_colors_unchanged;
-        if let Some(frame) = previous
-            .as_ref()
-            .filter(|frame| !full && dirty == Dirty::Clean && frame.cursor == cursor)
-        {
+        if let Some(frame) = previous.as_ref().filter(|frame| {
+            !full
+                && dirty == Dirty::Clean
+                && frame.cursor == cursor
+                && Arc::ptr_eq(&frame.images, &images)
+                && frame.graphics_warning == graphics_warning
+        }) {
             snapshot.set_dirty(Dirty::Clean)?;
             let frame = Arc::clone(frame);
             self.cached_colors = Some(colors);
@@ -562,25 +593,14 @@ impl GhosttyTerminal {
                 let owned = if let Some(cached) = same_row.filter(|_| !row_dirty) {
                     Arc::clone(cached)
                 } else {
-                    let mut cells = Vec::with_capacity(usize::from(self.size.columns()));
-                    let mut cell_iter = self.cell_iterator.update(row)?;
-                    while let Some(cell) = cell_iter.next() {
-                        cells.push(snapshot_cell(
-                            cell,
-                            &mut grapheme,
-                            foreground,
-                            background,
-                            &colors.palette,
-                        )?);
-                    }
-                    // Ghostty conservatively dirties cursor rows even when no
-                    // cells changed. Keep their identity so cursor movement
-                    // does not discard the renderer's shaped-row cache.
-                    if let Some(cached) = cached.filter(|previous| previous.as_ref() == &cells) {
-                        Arc::clone(cached)
-                    } else {
-                        Arc::new(cells)
-                    }
+                    snapshot_row(
+                        row,
+                        &mut self.cell_iterator,
+                        &mut grapheme,
+                        &colors,
+                        cached,
+                        self.size.columns(),
+                    )?
                 };
                 next_rows.insert(row_id, Arc::clone(&owned));
                 rows.push(owned);
@@ -597,12 +617,9 @@ impl GhosttyTerminal {
                     && previous.cursor == cursor
                     && previous.foreground == foreground
                     && previous.background == background
-                    && previous.rows.len() == rows.len()
-                    && previous
-                        .rows
-                        .iter()
-                        .zip(&rows)
-                        .all(|(before, after)| Arc::ptr_eq(before, after))
+                    && Arc::ptr_eq(&previous.images, &images)
+                    && previous.graphics_warning == graphics_warning
+                    && same_row_storage(&previous.rows, &rows)
             })
             .unwrap_or_else(|| {
                 Arc::new(TerminalFrame {
@@ -611,12 +628,22 @@ impl GhosttyTerminal {
                     cursor,
                     foreground,
                     background,
+                    images,
+                    graphics_warning,
                 })
             });
         self.cached_colors = Some(colors);
         self.cached_frame = Some(Arc::clone(&frame));
         Ok(frame)
     }
+}
+
+fn same_row_storage(before: &[Arc<Vec<Cell>>], after: &[Arc<Vec<Cell>>]) -> bool {
+    before.len() == after.len()
+        && before
+            .iter()
+            .zip(after)
+            .all(|(before, after)| Arc::ptr_eq(before, after))
 }
 
 fn from_ghostty(color: RgbColor) -> Rgb {
@@ -797,15 +824,17 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn optional_graphics_records_are_checked_before_omission() -> Result<()> {
+    fn graphics_records_are_preserved_and_checked_before_native_decode() -> Result<()> {
         assert_eq!(snapshot_crc32c(b"123456789", &[]), 0xe306_9283);
         let mut source = terminal()?;
         source.feed(b"safe text");
         let mut bytes = Vec::new();
         source.terminal.encode_snapshot(&mut bytes)?;
-        assert!(matches!(normalize_snapshot(&bytes)?, Cow::Borrowed(_)));
+        assert_eq!(normalize_snapshot(&bytes)?, bytes.as_slice());
         let extended = optional_graphics_snapshot(&bytes)?;
-        assert_eq!(normalize_snapshot(&extended)?.as_ref(), bytes.as_slice());
+        assert_eq!(normalize_snapshot(&extended)?, extended.as_slice());
+        // Correct framing does not make fabricated image metadata valid.
+        assert!(GhosttyTerminal::from_snapshot(&extended).is_err());
         let mut corrupt = extended.clone();
         corrupt[20] ^= 1;
         assert!(normalize_snapshot(&corrupt).is_err());
@@ -830,7 +859,6 @@ mod snapshot_tests {
         source.feed(b"one\r\ntwo\r\nthree\r\nfour\x1b[31m\xc3");
         let mut bytes = Vec::new();
         source.terminal.encode_snapshot(&mut bytes)?;
-        let bytes = optional_graphics_snapshot(&bytes)?;
         let mut restored = GhosttyTerminal::from_snapshot(&bytes)?;
         source.feed(b"\xa9");
         restored.feed(b"\xa9");

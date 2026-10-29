@@ -1,10 +1,7 @@
 //! Resolve Rex bindings before GPUI text delivery, preserving unbound IME commits.
 use super::{WorkspaceView, automation::Execution};
 use crate::{
-    core::{
-        Command,
-        input::{KeyInput, Modifiers},
-    },
+    core::{Command, input::KeyInput},
     rex::{
         actions,
         automation::ActionContext,
@@ -19,7 +16,7 @@ const MAX_QUEUED_KEYS: usize = 256;
 const MAX_QUEUED_BYTES: usize = 1024 * 1024;
 
 pub(super) enum Work {
-    Key(KeyInput),
+    Key(KeyInput, Option<String>),
     Arrange(crate::core::PaneId),
     Browse(crate::core::SessionId),
     Overview(crate::core::SessionId),
@@ -50,7 +47,11 @@ impl Work {
                 super::TerminalViewEvent::Text(text) => text.len(),
                 _ => 64,
             },
-            Self::Key(key) => key.key.len() + key.text.as_ref().map_or(0, String::len),
+            Self::Key(key, physical) => {
+                key.key.len()
+                    + key.text.as_ref().map_or(0, String::len)
+                    + physical.as_ref().map_or(0, String::len)
+            }
             Self::Text(text) => text.len(),
             Self::Action {
                 name,
@@ -146,9 +147,6 @@ impl WorkspaceView {
                         Some(format!("{source}: {message}"))
                     })
                     .collect();
-                self.shortcuts
-                    .diagnostics
-                    .extend(adapter_diagnostics(&source));
                 self.shortcuts.source = source;
                 cx.notify();
             }
@@ -162,8 +160,36 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.presentation.visible {
+            return;
+        }
+        if self.offline_shortcut(event, window, cx) {
+            return;
+        }
+        if self.palette.is_some() {
+            if !self.palette_is_composing(cx)
+                && self.overlay_action_key(
+                    event,
+                    &["client.palette.toggle", "client.quit"],
+                    window,
+                    cx,
+                )
+            {
+                return;
+            }
+            if self.palette_key(event, window, cx) {
+                return;
+            }
+        }
         if self.find.is_some() {
-            if !self.find_is_composing(cx) && self.find_toggle_key(event, window, cx) {
+            if !self.find_is_composing(cx)
+                && self.overlay_action_key(
+                    event,
+                    &["client.find.toggle", "client.palette.toggle", "client.quit"],
+                    window,
+                    cx,
+                )
+            {
                 return;
             }
             if self.find_key(event, window, cx) {
@@ -187,23 +213,13 @@ impl WorkspaceView {
         {
             return;
         }
-        let key = KeyInput {
-            key: event.keystroke.key.clone(),
-            text: event.keystroke.key_char.clone(),
-            modifiers: Modifiers {
-                shift: event.keystroke.modifiers.shift,
-                control: event.keystroke.modifiers.control,
-                alt: event.keystroke.modifiers.alt,
-                super_key: event.keystroke.modifiers.platform,
-            },
-            repeat: event.is_held,
-        };
+        let (key, physical) = crate::ui::platform_input::shortcut_input(event);
         if self.shortcuts.running {
-            self.queue_shortcut(Work::Key(key), window, cx);
+            self.queue_shortcut(Work::Key(key, physical), window, cx);
             cx.stop_propagation();
             return;
         }
-        match self.resolve_shortcut(&key) {
+        match self.resolve_shortcut(&key, physical.as_deref()) {
             Resolution::Passthrough => {}
             Resolution::Pending | Resolution::Consumed => {
                 cx.stop_propagation();
@@ -225,49 +241,101 @@ impl WorkspaceView {
         }
     }
 
-    fn resolve_shortcut(&mut self, key: &KeyInput) -> Resolution {
+    fn offline_shortcut(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.runtime.connected() && self.shortcuts.resolver.is_some() {
+            return false;
+        }
+        let key = &event.keystroke;
+        if !key.modifiers.control
+            || !key.modifiers.shift
+            || key.modifiers.alt
+            || key.modifiers.platform
+        {
+            return false;
+        }
+        match key.key.as_str() {
+            "q" => cx.quit(),
+            "p" => {
+                if let Err(error) = self.toggle_palette(window, cx) {
+                    self.report_error(error.message, cx);
+                }
+            }
+            _ => return false,
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        true
+    }
+
+    pub(super) fn submit_palette_action(
+        &mut self,
+        name: String,
+        args: Value,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.runtime.connected() {
+            if name == "client.quit" {
+                cx.quit();
+            } else {
+                self.report_error("Reconnect before running this command".into(), cx);
+            }
+            return;
+        }
+        let work = Work::Action {
+            name,
+            args,
+            prefix: Vec::new(),
+            key: None,
+        };
+        // Enter is a consequence of an already consumed queued key. Its selected
+        // command precedes any later buffered typing, as with rename submission.
+        if self.shortcuts.running {
+            self.push_shortcut(work, true, cx);
+        } else {
+            self.queue_shortcut(work, window, cx);
+        }
+    }
+
+    fn resolve_shortcut(&mut self, key: &KeyInput, physical: Option<&str>) -> Resolution {
         let Some(mut resolver) = self.shortcuts.resolver.take() else {
             return Resolution::Passthrough;
         };
-        // GPUI exposes layout keys, not hardware codes. Never manufacture a
-        // physical candidate from a logical character on another keyboard layout.
         let candidate = spelling(key);
-        let result = resolver.resolve(&[&candidate], key.repeat, |name, args| {
+        let candidates = shortcut_candidates(&candidate, physical);
+        let result = resolver.resolve(&candidates, key.repeat, |name, args| {
             self.shortcut_available(name, args)
         });
         self.shortcuts.resolver = Some(resolver);
         result
     }
 
-    fn find_toggle_key(
+    fn overlay_action_key(
         &mut self,
         event: &KeyDownEvent,
+        allowed: &[&str],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let key = KeyInput {
-            key: event.keystroke.key.clone(),
-            text: event.keystroke.key_char.clone(),
-            modifiers: Modifiers {
-                shift: event.keystroke.modifiers.shift,
-                control: event.keystroke.modifiers.control,
-                alt: event.keystroke.modifiers.alt,
-                super_key: event.keystroke.modifiers.platform,
-            },
-            repeat: event.is_held,
-        };
+        let (key, physical) = crate::ui::platform_input::shortcut_input(event);
         let candidate = spelling(&key);
         let Some(mut preview) = self.shortcuts.resolver.clone() else {
             return false;
         };
-        let resolved = preview.resolve(&[&candidate], key.repeat, |name, args| {
+        let candidates = shortcut_candidates(&candidate, physical.as_deref());
+        let resolved = preview.resolve(&candidates, key.repeat, |name, args| {
             self.shortcut_available(name, args)
         });
-        if !matches!(resolved, Resolution::Action(ref action) if action.name == "client.find.toggle")
+        if !matches!(resolved, Resolution::Action(ref action) if allowed.contains(&action.name.as_str()))
         {
             return false;
         }
-        if let Resolution::Action(action) = self.resolve_shortcut(&key) {
+        if let Resolution::Action(action) = self.resolve_shortcut(&key, physical.as_deref()) {
             self.queue_shortcut(
                 Work::Action {
                     name: action.name,
@@ -284,7 +352,7 @@ impl WorkspaceView {
         false
     }
 
-    fn shortcut_available(&self, name: &str, args: &Value) -> bool {
+    pub(super) fn shortcut_available(&self, name: &str, args: &Value) -> bool {
         if let Ok(action) = actions::parse(name, args) {
             return native_available(
                 &action,
@@ -326,7 +394,7 @@ impl WorkspaceView {
             return false;
         }
         let work = match event {
-            super::TerminalViewEvent::Key(key) => Work::Key(key.clone()),
+            super::TerminalViewEvent::Key(key) => Work::Key(key.clone(), None),
             super::TerminalViewEvent::Text(text) => Work::Text(text.clone()),
             super::TerminalViewEvent::Resized { .. }
             | super::TerminalViewEvent::FocusChanged(_) => return false,
@@ -417,7 +485,15 @@ impl WorkspaceView {
         true
     }
 
+    pub(super) fn clear_queued_shortcuts(&mut self) {
+        self.shortcuts.queue.clear();
+        self.shortcuts.bytes = 0;
+    }
+
     fn push_shortcut(&mut self, work: Work, first: bool, cx: &mut Context<Self>) -> bool {
+        if !self.presentation.visible {
+            return false;
+        }
         let bytes = work.bytes();
         if self.shortcuts.queue.len() >= MAX_QUEUED_KEYS
             || self.shortcuts.bytes.saturating_add(bytes) > MAX_QUEUED_BYTES
@@ -483,7 +559,8 @@ impl WorkspaceView {
                 }
                 let next = this.update_in(cx, |view, window, cx| {
                     view.poll(cx);
-                    if !view.runtime.connected()
+                    if !view.presentation.visible
+                        || !view.runtime.connected()
                         || view.runtime.connection_generation() != generation
                     {
                         view.shortcuts.running = false;
@@ -499,9 +576,9 @@ impl WorkspaceView {
                     view.shortcuts.executing = true;
                     let result = view.perform_shortcut(work, window, cx);
                     view.shortcuts.executing = false;
-                    Some(result)
+                    Some((result, view.presentation.generation))
                 });
-                let Ok(Some(result)) = next else {
+                let Ok(Some((result, presentation))) = next else {
                     return;
                 };
                 match result {
@@ -509,7 +586,9 @@ impl WorkspaceView {
                         let result = future.await;
                         let _ = this.update_in(cx, |view, _window, cx| {
                             view.poll(cx);
-                            if generation != view.runtime.connection_generation()
+                            if !view.presentation.visible
+                                || view.presentation.generation != presentation
+                                || generation != view.runtime.connection_generation()
                                 || !view.runtime.connected()
                             {
                                 return;
@@ -565,9 +644,12 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.replay_palette_input(work, window, cx) {
+            return true;
+        }
         if self.detached_browser.is_some() {
             match work {
-                Work::Key(key) => {
+                Work::Key(key, _) => {
                     if key.key == "escape" {
                         self.cancel_detached_browser(window, cx);
                     }
@@ -579,7 +661,7 @@ impl WorkspaceView {
         }
         if self.arranging.is_some() {
             match &work {
-                Work::Key(key) => {
+                Work::Key(key, _) => {
                     if key.key == "escape" {
                         self.cancel_arrangement(window, cx);
                     }
@@ -593,7 +675,7 @@ impl WorkspaceView {
             return false;
         };
         match work {
-            Work::Key(key) => dialog
+            Work::Key(key, _) => dialog
                 .input
                 .update(cx, |input, cx| input.replay_key(key, window, cx)),
             Work::Text(text) => dialog.input.update(cx, |input, cx| {
@@ -605,12 +687,14 @@ impl WorkspaceView {
     }
 
     fn shortcut_input_waiting(&self) -> bool {
-        self.rename.is_none()
+        self.presentation.visible
+            && self.rename.is_none()
+            && self.palette.is_none()
             && self.arranging.is_none()
             && self.detached_browser.is_none()
             && matches!(
                 self.shortcuts.queue.front(),
-                Some(Work::Key(_) | Work::Text(_))
+                Some(Work::Key(_, _) | Work::Text(_))
             )
             && self.active_pane().is_some_and(|pane| {
                 !self.runtime.input_available(pane)
@@ -708,7 +792,7 @@ impl WorkspaceView {
                 self.terminal_event(pane, &event, cx);
                 return Ok(None);
             }
-            Work::Key(key) => match self.resolve_shortcut(&key) {
+            Work::Key(key, physical) => match self.resolve_shortcut(&key, physical.as_deref()) {
                 Resolution::Action(action) => Work::Action {
                     name: action.name,
                     args: action.args,
@@ -858,38 +942,8 @@ impl Shortcuts {
     }
 }
 
-// The resolver can represent these keys, but GPUI has discarded their source
-// data before application listeners run. Surface the adapter boundary to users.
-fn adapter_diagnostics(source: &Value) -> Vec<String> {
-    let keys = source["bindings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|binding| binding["keys"].as_array().into_iter().flatten())
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    let mut messages = Vec::new();
-    if keys
-        .iter()
-        .any(|key| key.contains('[') && key.contains(']'))
-    {
-        messages.push(
-            "Physical shortcuts need hardware key codes that GPUI does not currently expose."
-                .into(),
-        );
-    }
-    if keys.iter().any(|key| {
-        key.split('+').any(|part| part == "shift")
-            && key.rsplit('+').next().is_some_and(|base| {
-                base.chars().count() == 1 && base.chars().any(|ch| !ch.is_alphabetic())
-            })
-    }) {
-        messages.push(
-            "Shifted number and punctuation shortcuts need key data that GPUI currently discards."
-                .into(),
-        );
-    }
-    messages
+fn shortcut_candidates<'a>(logical: &'a str, physical: Option<&'a str>) -> Vec<&'a str> {
+    std::iter::once(logical).chain(physical).collect()
 }
 
 fn native_available(
@@ -913,6 +967,8 @@ fn native_available(
                 })
         }),
         NativeAction::NewSession
+        | NativeAction::TogglePalette
+        | NativeAction::Quit
         | NativeAction::FontIncrease
         | NativeAction::FontDecrease
         | NativeAction::FontReset

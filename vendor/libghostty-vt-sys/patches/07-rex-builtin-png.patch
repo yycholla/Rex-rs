@@ -1,0 +1,36 @@
+--- a/src/terminal/sys.zig
++++ b/src/terminal/sys.zig
+@@ -16,7 +16,9 @@
+ /// and the exact semantics are up to callers. For example, the Kitty Graphics
+ /// Protocol will work but cannot accept PNG images.
+ pub var decode_png: ?DecodePngFn = png: {
+-    if (build_options.artifact == .lib) break :png null;
++    // Rex-rs embeds the already-linked Wuffs decoder at build time.
++    // No process-global runtime callback installation is needed.
++    if (!build_options.kitty_graphics) break :png null;
+     break :png &decodePngWuffs;
+ };
+ 
+--- a/src/terminal/kitty/graphics_image.zig
++++ b/src/terminal/kitty/graphics_image.zig
+@@ -20,7 +20,8 @@
+ const max_dimension = 10000;
+ 
+ /// Maximum size in bytes, taken from Kitty.
+-const max_size = 400 * 1024 * 1024; // 400MB
++// Rex-rs bounds transient image decoding independently of persistent storage.
++const max_size = 64 * 1024 * 1024; // 64 MiB
+ 
+ /// An image that is still being loaded. The image should be initialized
+ /// using init on the first chunk and then addData for each subsequent
+--- a/src/terminal/c/snapshot.zig
++++ b/src/terminal/c/snapshot.zig
+@@ -472,6 +472,8 @@
+         .{
+             .max_continuation_bytes = decoder.max_continuation_bytes,
+             .compress_history = decoder.compress_history,
++            // Rex-rs restores each screen under the same bound as live graphics.
++            .kitty_image_storage_limit = 16 * 1024 * 1024,
+         },
+     );
+     defer decoded.deinit(decoder.alloc);

@@ -7,14 +7,15 @@ desktop → ui → rex client worker → Rex control + terminal WebSockets
                  └ owned presentation views + terminal frames → ui
 ```
 
-`rex/transport.rs` owns the local Unix WebSocket on a dedicated IO thread, with
+`rex/transport.rs` owns the Unix/TCP/TLS WebSocket on a dedicated IO thread, with
 request correlation, bounded event buffering, revision negotiation and reconnect
 identity. Its blocking facade serves the terminal worker; cloned control handles
 provide asynchronous replies and nested requests. Requests are matched by ID,
 including out-of-order responses whose sequence watermarks can decrease. Ordinary
 requests have 64 slots; eight separate priority reply slots prevent callback
-completion from being blocked by ordinary saturation. Unsupported cross-server
-callbacks receive prompt errors, and uncertain mutations are never replayed.
+completion from being blocked by ordinary saturation. Named cross-server callbacks use a bounded registry and exact connection leases;
+unknown or busy destinations are refused before sending. Uncertain mutations are
+never replayed.
 `rex/workspace.rs` validates authoritative session views independently
 of the local workspace mutation engine. Rex string IDs map losslessly to stable
 presentation IDs; per-session revisions reject stale views. Its presentation
@@ -68,9 +69,16 @@ restore and local operations, so a queued search uses the current layout. Hiding
 stops active drag/autoscroll while preserving native selection; late hidden Press/Drag
 events are discarded, while release/cancel/clear and history navigation remain valid.
 Spans with a mismatched viewport are cleared rather than attached to an older frame.
-Visible frame materialization precedes full annotation extraction. Visible match
-endpoints use viewport-relative lookup and local ordering, with Screen-space fallback
-for long/offscreen matches; native history matching and highlight coverage are unchanged. Pointer commands carry the displayed viewport
+Visible span publication remains paired with the frame viewport. Owned search
+spans are reused during history-only progress while counts and completion advance.
+Terminal writes, query/navigation, scrolling/autoscroll, resize, reveal and observed
+viewport changes invalidate them; changed selected indices also force extraction.
+On a due visible refresh without an active drag, snapshot extraction supplies the
+native feed before ticking, avoiding a separate feed followed by snapshot's feed.
+The tick then updates progress using the owned spans. No native match references
+survive a terminal mutation. Native feed/tick and match extraction remain synchronous.
+Visible match endpoints use viewport-relative lookup and local ordering, with
+Screen-space fallback for long/offscreen matches. Pointer commands carry the displayed viewport
 token, and native selection rejects stale tokens. The find overlay in
 `ui/workspace/find.rs` consumes text/composition locally and does not change grid size.
 
@@ -86,7 +94,7 @@ metadata, launch a custom server or stop Rex on exit. The local state engine,
 PTY runtime and private server below remain development regression fixtures;
 their persistence/controller semantics do not describe the native Rex path.
 
-`rex/actions.rs` defines the strict registry of 35 native actions. `rex/action_worker.rs`
+`rex/actions.rs` defines the strict registry of 37 native actions. `rex/action_worker.rs`
 translates workspace actions through the same core command boundary used by
 buttons, preserves request diagnostics and refreshes authoritative views before
 completing actions. The bounded callback mailbox carries owned generation-tagged
@@ -354,3 +362,18 @@ and primary font. Paint-only changes continue to reuse cached geometry.
 `REX_RS_GLYPH_TRACE` enables bounded diagnostic records (256 per process): `1`
 selects all nonempty rows, another nonempty value filters by substring. Records
 include terminal text and font/glyph identities; tracing is disabled by default.
+
+### Multiple servers in one window
+
+`ui/servers.rs` owns a visible connection list and one independent `WorkspaceView`
+per endpoint. Switching presentation never swaps a shared runtime: pane aliases,
+replicas, queued operations and reconnect credentials stay with their client.
+Background host discovery reads `hosts.list` without changing Rex's registry.
+Adding/disconnecting/reconnecting connections is available in the UI; optional
+startup endpoints seed the same list.
+
+Every child binds to the host window for prompt callback replies, including before
+its first render. Inactive children stop terminal animation, reject local input
+except release/blur cleanup, refuse UI callbacks, and guard asynchronous clipboard
+and link completions with a presentation generation. Disconnect drops only that
+client. Quit detaches every client and leaves server-owned programs running.

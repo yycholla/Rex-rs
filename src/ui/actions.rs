@@ -1,4 +1,4 @@
-use gpui::{App, KeyBinding, actions};
+use gpui::{App, actions};
 
 actions!(
     rex_rs,
@@ -26,8 +26,7 @@ actions!(
     ]
 );
 
-pub fn register(cx: &mut App) {
-    // Quit remains a process-level shortcut; workspace shortcuts are resolved
-    // from Rex's merged keymap, including removals and configuration overrides.
-    cx.bind_keys([KeyBinding::new("ctrl-shift-q", Quit, Some("Workspace"))]);
+pub fn register(_cx: &mut App) {
+    // All keyboard defaults, including Quit, go through Rex's merged keymap.
+    // The workspace supplies a disconnected fallback before a keymap is ready.
 }

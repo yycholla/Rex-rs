@@ -1,5 +1,9 @@
 use super::*;
-use std::{io::Read as _, os::unix::net::UnixListener, thread};
+use std::{
+    io::Read as _,
+    os::unix::net::{UnixListener, UnixStream},
+    thread,
+};
 use tungstenite::protocol::Role;
 
 fn replica() -> Result<StreamDecoder> {
@@ -15,7 +19,7 @@ fn stream(decoder: StreamDecoder) -> Result<(TerminalStream, UnixStream)> {
     let (local, peer) = UnixStream::pair()?;
     Ok((
         TerminalStream {
-            socket: WebSocket::from_raw_socket(local, Role::Client, None),
+            socket: WebSocket::from_raw_socket(RexStream::Unix(local), Role::Client, None),
             endpoint: String::new(),
             welcome: Welcome {
                 token: [7; 16],

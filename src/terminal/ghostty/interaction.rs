@@ -61,11 +61,65 @@ enum Visibility {
     Hidden,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchSpans {
+    Stale,
+    Current,
+}
+
+// Opt-in owner-thread timings never include queries or terminal contents.
+#[derive(Default)]
+struct SearchTimings {
+    enabled: bool,
+    elapsed: [Duration; 5],
+    calls: [u64; 5],
+    last_report: Option<Instant>,
+}
+
+impl SearchTimings {
+    fn start(&self) -> Option<Instant> {
+        self.enabled.then(Instant::now)
+    }
+
+    fn record(&mut self, stage: usize, started: Option<Instant>) {
+        if let Some(started) = started {
+            self.elapsed[stage] += started.elapsed();
+            self.calls[stage] += 1;
+        }
+    }
+
+    fn report(&mut self) {
+        if !self.enabled
+            || self
+                .last_report
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        eprintln!(
+            "terminal-search feed_us={} tick_us={} snapshot_us={} matches_us={} spans_us={} calls={:?}",
+            self.elapsed[0].as_micros(),
+            self.elapsed[1].as_micros(),
+            self.elapsed[2].as_micros(),
+            self.elapsed[3].as_micros(),
+            self.elapsed[4].as_micros(),
+            self.calls
+        );
+        self.elapsed = [Duration::ZERO; 5];
+        self.calls = [0; 5];
+        self.last_report = Some(Instant::now());
+    }
+}
+
 pub(super) struct Interaction {
     search: Option<Search<'static, 'static>>,
+    timings: SearchTimings,
     query: String,
     generation: u64,
     feed_pending: bool,
+    search_spans: SearchSpans,
+    #[cfg(test)]
+    search_span_extractions: u64,
     visibility: Visibility,
     #[cfg(test)]
     highlight_extractions: u64,
@@ -92,9 +146,16 @@ impl Interaction {
     pub(super) fn new() -> Result<Self> {
         Ok(Self {
             search: None,
+            timings: SearchTimings {
+                enabled: std::env::var_os("REX_RS_SEARCH_STATS").is_some(),
+                ..SearchTimings::default()
+            },
             query: String::new(),
             generation: 0,
             feed_pending: false,
+            search_spans: SearchSpans::Stale,
+            #[cfg(test)]
+            search_span_extractions: 0,
             visibility: Visibility::Visible,
             #[cfg(test)]
             highlight_extractions: 0,
@@ -119,6 +180,7 @@ impl Interaction {
     }
 
     pub(super) fn mutated(&mut self) {
+        self.search_spans = SearchSpans::Stale;
         self.feed_pending = true;
         self.presentation_pending = true;
     }
@@ -162,6 +224,7 @@ impl GhosttyTerminal {
                 self.interaction.reset_gesture(&self.terminal);
             }
             self.interaction.visibility = visibility;
+            self.interaction.search_spans = SearchSpans::Stale;
             self.interaction.presentation_pending = true;
             self.interaction.next_publication = Instant::now();
         }
@@ -220,6 +283,7 @@ impl GhosttyTerminal {
                 }
             }
         }
+        state.search_spans = SearchSpans::Stale;
         state.presentation_pending = true;
         state.next_publication = Instant::now();
         Ok(())
@@ -356,17 +420,34 @@ impl GhosttyTerminal {
     /// Reports native search, gesture or presentation extraction failures.
     pub fn interaction_tick(&mut self) -> Result<bool> {
         let before = self.interaction.annotations.revision;
+        // Snapshot already feeds the native search. When a visible refresh is due,
+        // capture spans first and let the following history tick reuse those owned
+        // spans. Avoid an explicit feed immediately followed by snapshot's feed.
+        // A drag may scroll below, so it retains the normal post-gesture path.
+        let captured = self.interaction.search.is_some()
+            && self.interaction.search_spans == SearchSpans::Stale
+            && self.interaction.visibility == Visibility::Visible
+            && !self.interaction.dragging
+            && self.interaction.presentation_pending
+            && Instant::now() >= self.interaction.next_publication;
+        if captured {
+            self.annotations()?;
+        }
         let geometry = self.selection_geometry();
         let state = &mut self.interaction;
         if let Some(search) = &mut state.search {
             state.presentation_pending |=
                 state.feed_pending || search.status()? != Status::Complete;
             if state.feed_pending || search.status()? == Status::FeedRequired {
+                let started = state.timings.start();
                 search.feed(&mut self.terminal)?;
+                state.timings.record(0, started);
                 state.feed_pending = false;
             }
             if search.status()? != Status::Complete {
+                let started = state.timings.start();
                 search.tick()?;
+                state.timings.record(1, started);
             }
         }
         if state.dragging && Instant::now() >= state.next_autoscroll {
@@ -394,11 +475,12 @@ impl GhosttyTerminal {
                     self.terminal.set_selection(Some(&selection))?;
                 }
                 state.feed_pending = true;
+                state.search_spans = SearchSpans::Stale;
                 state.presentation_pending = true;
             }
         }
         let after = if self.interaction.presentation_pending
-            && Instant::now() >= self.interaction.next_publication
+            && (captured || Instant::now() >= self.interaction.next_publication)
         {
             self.annotations()?.revision
         } else {
@@ -440,6 +522,7 @@ impl GhosttyTerminal {
                 self.terminal
                     .track_grid_ref(Point::Viewport(PointCoordinate { x: 0, y: 0 }))?,
             );
+            state.search_spans = SearchSpans::Stale;
             state.viewport_screen = Some(screen);
             state.viewport_rows = row_ids;
             state.viewport_size = Some(self.size);
@@ -505,7 +588,9 @@ impl GhosttyTerminal {
         };
         if state.visibility == Visibility::Hidden {
             if state.feed_pending || search.status()? == Status::FeedRequired {
+                let started = state.timings.start();
                 search.feed(&mut self.terminal)?;
+                state.timings.record(0, started);
                 state.feed_pending = false;
             }
             return Ok(Some(SearchState {
@@ -518,7 +603,28 @@ impl GhosttyTerminal {
                 selected_match: Vec::new(),
             }));
         }
+        // Native viewport matching is independent of history discovery. History
+        // ticks append older matches without changing existing selected results.
+        // Cache only owned spans, and invalidate on every terminal/query/viewport
+        // mutation. A changed selected index also forces a fresh native snapshot.
+        if state.search_spans == SearchSpans::Current
+            && let Some(previous) = &state.annotations.search
+            && previous.generation == state.generation
+            && previous.selected == search.selected_index()?.map(u64::try_from).transpose()?
+        {
+            return Ok(Some(SearchState {
+                complete: search.status()? == Status::Complete,
+                total: u64::try_from(search.total_matches()?)?,
+                ..previous.clone()
+            }));
+        }
+        #[cfg(test)]
+        {
+            state.search_span_extractions += 1;
+        }
+        let started = state.timings.start();
         let snapshot = search.snapshot(&mut self.terminal)?;
+        state.timings.record(2, started);
         let terminal = snapshot.terminal();
         let viewport = terminal.grid_ref(Point::Viewport(PointCoordinate { x: 0, y: 0 }))?;
         let origin_y = terminal
@@ -527,7 +633,11 @@ impl GhosttyTerminal {
             .y;
         let mut highlights =
             vec![false; usize::from(self.size.columns()) * usize::from(self.size.rows())];
-        for selection in snapshot.viewport_matches(&mut state.match_buffer)? {
+        let started = state.timings.start();
+        let matches = snapshot.viewport_matches(&mut state.match_buffer)?;
+        state.timings.record(3, started);
+        let started = state.timings.start();
+        for selection in matches {
             mark_selection(
                 terminal,
                 &selection,
@@ -548,9 +658,12 @@ impl GhosttyTerminal {
                 &mut selected_highlight,
             )?;
         }
+        state.timings.record(4, started);
+        state.timings.report();
         // Snapshot::snapshot itself feeds. Read counts afterwards so progress
         // describes the same native state used for these highlights.
         state.feed_pending = false;
+        state.search_spans = SearchSpans::Current;
         let complete = search.status()? == Status::Complete;
         let total = u64::try_from(search.total_matches()?)?;
         let selected = search.selected_index()?.map(u64::try_from).transpose()?;

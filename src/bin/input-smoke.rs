@@ -18,6 +18,7 @@ fn main() -> Result<()> {
 
 fn key(name: &str) -> KeyInput {
     KeyInput {
+        physical_key: None,
         key: name.into(),
         text: None,
         modifiers: Modifiers::default(),

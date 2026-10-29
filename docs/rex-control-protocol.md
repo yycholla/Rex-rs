@@ -49,8 +49,11 @@ bootstrapped, subscribed to session events or loaded scripts can be discarded
 immediately on disconnect. Merely connecting and fetching `server.version` is
 therefore insufficient for testing resume.
 
-Only local `unix://` endpoints are currently supported. Remote TLS, Tailscale
-endpoint selection and authentication UI remain separate work.
+Explicit `unix://`, HTTP(S) and WS(S) origins are supported. Network origins
+select the same fixed API paths; credentials, query strings, fragments and
+custom paths are rejected. TLS verifies system trust and hostnames. The server
+must already authorize the transport identity; login and Tailscale account
+selection UI remain separate work.
 
 ## Verification
 

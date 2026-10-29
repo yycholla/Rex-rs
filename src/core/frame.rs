@@ -132,12 +132,50 @@ pub struct CellRun {
     pub style: CellStyle,
 }
 
+/// Owned image pixels; native handles never leave their terminal owner thread.
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalImage {
+    pub id: u32,
+    pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<Vec<u8>>,
+}
+
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImageLayer {
+    BelowBackground,
+    BelowText,
+    AboveText,
+}
+
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImagePlacement {
+    pub image: Arc<TerminalImage>,
+    pub layer: ImageLayer,
+    pub z: i32,
+    pub column: i32,
+    pub row: i32,
+    pub cell_offset: [u32; 2],
+    pub pixel_size: [u32; 2],
+    pub source: [u32; 4],
+    /// Native pixel dimensions of one cell, for scaling to this UI's font.
+    pub cell_size: [u32; 2],
+}
+
 /// Immutable terminal row shared across frames when its cells have not changed.
 pub type TerminalRow = Arc<Vec<Cell>>;
 
 #[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalFrame {
+    #[cfg_attr(feature = "ghostty", serde(default))]
+    pub images: Arc<Vec<ImagePlacement>>,
+    #[cfg_attr(feature = "ghostty", serde(default))]
+    pub graphics_warning: Option<String>,
     pub size: GridSize,
     /// One vector entry per physical column, including wide-character spacers.
     pub rows: Vec<TerminalRow>,
@@ -221,6 +259,8 @@ mod tests {
     #[test]
     fn diagnostic_text_preserves_graphemes_without_duplicating_wide_cells() {
         let frame = TerminalFrame {
+            images: Arc::default(),
+            graphics_warning: None,
             size: GridSize::new(5, 1).unwrap(),
             rows: vec![Arc::new(vec![
                 Cell {

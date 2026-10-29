@@ -472,6 +472,27 @@ impl Session {
 #[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
 pub enum Command {
+    FloatPane {
+        pane: PaneId,
+        bounds: [f64; 4],
+    },
+    ResizeLayer {
+        session: SessionId,
+        layer: String,
+        bounds: [f64; 4],
+    },
+    RaiseLayer {
+        session: SessionId,
+        layer: String,
+    },
+    LowerLayer {
+        session: SessionId,
+        layer: String,
+    },
+    CloseLayer {
+        session: SessionId,
+        layer: String,
+    },
     CreateSession {
         title: String,
     },
@@ -615,6 +636,11 @@ impl Workspace {
     /// exhausted IDs. Validation failures leave state unchanged.
     pub fn apply(&mut self, command: Command) -> Result<(), WorkspaceError> {
         match command {
+            Command::FloatPane { .. }
+            | Command::ResizeLayer { .. }
+            | Command::RaiseLayer { .. }
+            | Command::LowerLayer { .. }
+            | Command::CloseLayer { .. } => return Err(WorkspaceError::UnsupportedNativeLayout),
             Command::CreateSession { title } => self.create_session(&title)?,
             Command::SelectSession(id) => {
                 self.session_index(id)?;
@@ -1160,6 +1186,7 @@ fn legacy_move_ratio(ratio: f64) -> u16 {
 #[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceError {
+    UnsupportedNativeLayout,
     EmptyTitle,
     NoActiveSession,
     NoActiveWindow,
@@ -1177,6 +1204,9 @@ pub enum WorkspaceError {
 impl fmt::Display for WorkspaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedNativeLayout => {
+                f.write_str("floating layers require the official Rex backend")
+            }
             Self::EmptyTitle => f.write_str("title cannot be empty"),
             Self::NoActiveSession => f.write_str("no session is selected"),
             Self::NoActiveWindow => f.write_str("the selected session has no attached window"),
@@ -1223,6 +1253,43 @@ mod tests {
 
     fn active_layout(workspace: &Workspace) -> &Layout {
         active_window(workspace).layout()
+    }
+
+    #[test]
+    fn legacy_workspace_rejects_native_layers_without_mutation() {
+        let mut workspace = workspace();
+        let before = workspace.clone();
+        let pane = focused(&workspace);
+        let session = workspace.active_session().unwrap().id();
+        for command in [
+            Command::FloatPane {
+                pane,
+                bounds: [0.1, 0.1, 0.8, 0.8],
+            },
+            Command::ResizeLayer {
+                session,
+                layer: "layer:test".into(),
+                bounds: [0.0, 0.0, 1.0, 1.0],
+            },
+            Command::RaiseLayer {
+                session,
+                layer: "layer:test".into(),
+            },
+            Command::LowerLayer {
+                session,
+                layer: "layer:test".into(),
+            },
+            Command::CloseLayer {
+                session,
+                layer: "layer:test".into(),
+            },
+        ] {
+            assert_eq!(
+                workspace.apply(command),
+                Err(WorkspaceError::UnsupportedNativeLayout)
+            );
+            assert_eq!(workspace, before);
+        }
     }
 
     #[test]

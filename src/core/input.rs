@@ -18,6 +18,9 @@ pub struct Modifiers {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyInput {
     pub key: String,
+    /// Observed physical position (for example `KeyQ`), independent of layout.
+    #[cfg_attr(feature = "ghostty", serde(default))]
+    pub physical_key: Option<String>,
     pub text: Option<String>,
     pub modifiers: Modifiers,
     pub repeat: bool,

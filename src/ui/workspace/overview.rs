@@ -162,8 +162,7 @@ impl WorkspaceView {
         let panes: Vec<PaneId> = session
             .windows()
             .iter()
-            .filter_map(WindowView::layout)
-            .flat_map(Layout::panes)
+            .flat_map(WindowView::placed_panes)
             .collect();
         let mut summary = div()
             .flex()
@@ -453,7 +452,7 @@ impl WorkspaceView {
         let theme = self.theme;
         let colors = theme.colors;
         let tab_id = tab.id();
-        let panes = tab.layout().map(Layout::panes).unwrap_or_default();
+        let panes = tab.placed_panes();
         let busy = panes
             .iter()
             .filter(|pane| self.pane_activity(**pane, insights) == Activity::Busy)
@@ -467,11 +466,37 @@ impl WorkspaceView {
                     .size_full()
                     .text_size(px(11.))
                     .text_color(rgb(colors.faint))
-                    .child("No tiled layout")
+                    .child(if panes.is_empty() {
+                        "Empty tab"
+                    } else {
+                        "Floating workspace"
+                    })
                     .into_any_element()
             },
             |layout| self.miniature(layout, tab.active_pane(), insights),
         );
+        let floating = tab
+            .layers
+            .iter()
+            .filter(|layer| layer.is_floating())
+            .count();
+        let preview = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .gap_1()
+            .child(div().flex_1().min_h_0().child(preview))
+            .when(floating > 0, |preview| {
+                preview.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(colors.muted))
+                        .child(format!(
+                            "{floating} floating {}",
+                            if floating == 1 { "layer" } else { "layers" }
+                        )),
+                )
+            });
         div()
             .id(SharedString::from(format!("overview-tab-{tab_id}")))
             .flex()

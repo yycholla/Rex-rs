@@ -25,6 +25,9 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.presentation.visible {
+            return;
+        }
         if self.defer_native_action(&action, cx) {
             return;
         }
@@ -110,8 +113,13 @@ impl WorkspaceView {
                         result
                     })
                     .unwrap_or_else(|error| Err(ActionError::internal(error.to_string())));
-                if let Ok(reply) = request.reply(result) {
-                    let _ = reply.await;
+                let quit = request.action == "client.quit" && result.is_ok();
+                if let Ok(reply) = request.reply(result)
+                    && reply.await.is_ok()
+                    && quit
+                {
+                    let _ = this.update(cx, |_, cx| cx.quit());
+                    return;
                 }
             }
         }));
@@ -123,6 +131,11 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Execution, ActionError> {
+        if !self.presentation.visible {
+            return Err(ActionError::refused(
+                "Select this server before running a desktop action",
+            ));
+        }
         if !self.runtime.action_request_current(request) {
             return Err(ActionError::refused(
                 "The action belongs to an old client connection",
@@ -141,6 +154,12 @@ impl WorkspaceView {
                 ActionError::unsupported(error.to_string())
             }
         })?;
+        if action == NativeAction::Quit {
+            return Ok(Execution::Local(Value::Null));
+        }
+        if action == NativeAction::Copy {
+            return self.copy_action(&request.context, true, window, cx);
+        }
         self.execute_native_action(action, &request.context, window, cx)
     }
 
@@ -151,6 +170,11 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Execution, ActionError> {
+        if !self.presentation.visible {
+            return Err(ActionError::refused(
+                "Select this server before running a desktop action",
+            ));
+        }
         // This entry point is shared by buttons, resolved shortcuts and remote
         // callbacks. Validate sender context before changing presentation too.
         validate_context(self.runtime.state(), context)
@@ -159,6 +183,14 @@ impl WorkspaceView {
             self.reveal_terminal(cx);
         }
         let value = match action {
+            NativeAction::TogglePalette => {
+                self.toggle_palette(window, cx)?;
+                Value::Null
+            }
+            NativeAction::Quit => {
+                cx.quit();
+                Value::Null
+            }
             NativeAction::Find => {
                 self.toggle_find(context, window, cx)?;
                 Value::Null
@@ -171,7 +203,7 @@ impl WorkspaceView {
                 return self.toggle_detached_action(context, window, cx);
             }
             NativeAction::ArrangePane => {
-                if self.rename.is_some() {
+                if self.rename.is_some() || self.palette.is_some() {
                     return Err(ActionError::refused(
                         "Finish renaming before arranging a pane",
                     ));
@@ -203,19 +235,7 @@ impl WorkspaceView {
                 Value::Null
             }
             NativeAction::FontIncrease | NativeAction::FontDecrease | NativeAction::FontReset => {
-                let current = self.theme.terminal.font_size;
-                self.theme.terminal.font_size = match action {
-                    NativeAction::FontIncrease => (current + 1.).min(40.),
-                    NativeAction::FontDecrease => (current - 1.).max(8.),
-                    _ => super::Theme::default().terminal.font_size,
-                };
-                let size = self.theme.terminal.font_size;
-                for pane in self.panes.values() {
-                    pane.view
-                        .update(cx, |view, cx| view.set_font_size(size, cx));
-                }
-                cx.notify();
-                json!({"font_size":size})
+                self.font_action(&action, cx)
             }
             NativeAction::ToggleSidebar => {
                 self.sidebar_visible = !self.sidebar_visible;
@@ -223,7 +243,7 @@ impl WorkspaceView {
                 json!({"visible":self.sidebar_visible})
             }
             NativeAction::Copy => {
-                return self.copy_action(context, window, cx);
+                return self.copy_action(context, false, window, cx);
             }
             NativeAction::Paste => {
                 let pane = self.action_pane(context)?;
@@ -251,11 +271,28 @@ impl WorkspaceView {
         Ok(Execution::Local(value))
     }
 
+    fn font_action(&mut self, action: &NativeAction, cx: &mut Context<Self>) -> Value {
+        let current = self.theme.terminal.font_size;
+        self.theme.terminal.font_size = match action {
+            NativeAction::FontIncrease => (current + 1.).min(40.),
+            NativeAction::FontDecrease => (current - 1.).max(8.),
+            _ => super::Theme::default().terminal.font_size,
+        };
+        let size = self.theme.terminal.font_size;
+        for pane in self.panes.values() {
+            pane.view
+                .update(cx, |view, cx| view.set_font_size(size, cx));
+        }
+        cx.notify();
+        json!({"font_size":size})
+    }
+
     /// Resolve the action only after owner-thread formatting and the clipboard
     /// write, so a following paste observes this copy in every dispatch lane.
     fn copy_action(
         &mut self,
         context: &ActionContext,
+        callback: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Execution, ActionError> {
@@ -269,10 +306,13 @@ impl WorkspaceView {
         let session = block.session_id.clone();
         let instance = self.runtime.state().instance_id().to_owned();
         let generation = self.runtime.connection_generation();
-        let native = self
-            .runtime
-            .copy_selection(pane)
-            .map_err(|error| ActionError::refused(error.to_string()))?;
+        let presentation = self.presentation.generation;
+        let native = if callback {
+            self.runtime.copy_callback_selection(pane)
+        } else {
+            self.runtime.copy_selection(pane)
+        }
+        .map_err(|error| ActionError::refused(error.to_string()))?;
         let (sender, future) = completion();
         cx.spawn_in(window, async move |this, cx| {
             if sender.is_cancelled() {
@@ -288,6 +328,10 @@ impl WorkspaceView {
                     if sender.is_cancelled() {
                         return Ok(Value::Null);
                     }
+                    anyhow::ensure!(
+                        view.presentation.visible && view.presentation.generation == presentation,
+                        "Server selection changed before copy completed"
+                    );
                     anyhow::ensure!(
                         view.runtime.connected()
                             && view.runtime.state().instance_id() == instance
@@ -445,7 +489,9 @@ fn native_reveals_terminal(action: &NativeAction) -> bool {
         | NativeAction::DetachPane
         | NativeAction::RestorePane { .. }
         | NativeAction::Paste => true,
-        NativeAction::FontIncrease
+        NativeAction::TogglePalette
+        | NativeAction::Quit
+        | NativeAction::FontIncrease
         | NativeAction::FontDecrease
         | NativeAction::FontReset
         | NativeAction::ToggleSidebar

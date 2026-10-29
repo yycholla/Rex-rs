@@ -339,3 +339,120 @@ pub fn empty_state(
                 .child(message),
         )
 }
+
+/// Presentation of one server group header in the sidebar tree.
+pub struct ServerHeader {
+    pub name: SharedString,
+    /// A short endpoint or summary shown after the name.
+    pub detail: SharedString,
+    pub transport: Icon,
+    pub status_color: u32,
+    pub expanded: bool,
+    /// Disconnected servers recede behind connected ones.
+    pub dimmed: bool,
+}
+
+/// A server group header: the top level of the sidebar tree. Callers supply
+/// trailing `actions`, revealed on hover in place of the status dot.
+#[must_use]
+pub fn server_header(
+    id: impl Into<ElementId>,
+    header: ServerHeader,
+    actions: Div,
+    theme: Theme,
+) -> Stateful<Div> {
+    let colors = theme.colors;
+    let ServerHeader {
+        name,
+        detail,
+        transport,
+        status_color,
+        expanded,
+        dimmed,
+    } = header;
+    sidebar_row(id.into(), false, theme)
+        .h(px(32.))
+        .gap(px(7.))
+        .group("server-header")
+        .child(icon(
+            if expanded {
+                Icon::ChevronDown
+            } else {
+                Icon::ChevronRight
+            },
+            12.,
+            colors.faint,
+        ))
+        .child(icon(
+            transport,
+            13.,
+            if dimmed { colors.faint } else { colors.muted },
+        ))
+        .child(
+            div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .items_baseline()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex_none()
+                        .max_w(px(140.))
+                        .truncate()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(if dimmed { colors.muted } else { colors.text }))
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(theme.terminal.font_family)
+                        .text_size(px(10.))
+                        .text_color(rgb(colors.faint))
+                        .child(detail),
+                ),
+        )
+        .child(
+            div()
+                .relative()
+                .flex()
+                .flex_none()
+                .items_center()
+                .child(
+                    actions
+                        .flex()
+                        .gap(px(2.))
+                        .opacity(0.)
+                        .group_hover("server-header", |style| style.opacity(1.)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(4.))
+                        .top(px(9.))
+                        .child(status_dot(status_color))
+                        .group_hover("server-header", |style| style.opacity(0.)),
+                ),
+        )
+}
+
+/// Replaces a server's session tree while it has none to show, such as
+/// "Connecting…" or a connection error. Callers append a recovery action.
+#[must_use]
+pub fn server_state_line(message: impl Into<SharedString>, color: u32) -> Div {
+    let message: SharedString = message.into();
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .min_h(px(28.))
+        .pl(px(28.))
+        .pr_2()
+        .text_size(px(11.))
+        .text_color(rgb(color))
+        .child(div().flex_1().min_w_0().line_clamp(2).child(message))
+}

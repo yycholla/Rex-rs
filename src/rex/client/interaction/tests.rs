@@ -34,6 +34,8 @@ fn fixture() -> Result<(WorkspaceClient, Receiver<QueuedOperation>, Vec<PaneId>)
         "fixture did not retain valid terminal panes"
     );
     let frame = Arc::new(TerminalFrame {
+        images: Arc::default(),
+        graphics_warning: None,
         size: GridSize::new(1, 1)?,
         rows: vec![Arc::new(vec![Cell::default()])],
         cursor: None,

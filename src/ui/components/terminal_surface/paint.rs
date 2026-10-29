@@ -264,6 +264,8 @@ mod tests {
 
     fn frame() -> Result<TerminalFrame> {
         Ok(TerminalFrame {
+            images: Arc::default(),
+            graphics_warning: None,
             size: GridSize::new(3, 1)?,
             rows: vec![Arc::new(vec![
                 Cell {

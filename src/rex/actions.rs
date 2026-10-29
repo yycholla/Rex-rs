@@ -63,6 +63,8 @@ pub enum NativeAction {
     Find,
     FindNext,
     FindPrevious,
+    TogglePalette,
+    Quit,
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +89,18 @@ struct ActionSpec {
 }
 
 const ACTIONS: &[ActionSpec] = &[
+    ActionSpec {
+        name: "client.palette.toggle",
+        title: "Command Palette",
+        description: "Find and run a desktop command.",
+        arguments: Arguments::Empty,
+    },
+    ActionSpec {
+        name: "client.quit",
+        title: "Quit Rex",
+        description: "Detach this desktop without stopping server-owned programs.",
+        arguments: Arguments::Empty,
+    },
     ActionSpec {
         name: "session.select",
         title: "Select Session",
@@ -464,6 +478,8 @@ pub fn parse(name: &str, args: &Value) -> Result<NativeAction> {
         "client.find.toggle" => NativeAction::Find,
         "client.find.next" => NativeAction::FindNext,
         "client.find.previous" => NativeAction::FindPrevious,
+        "client.palette.toggle" => NativeAction::TogglePalette,
+        "client.quit" => NativeAction::Quit,
         "pane.move" => parse_move(object)?,
         "pane.swap" => NativeAction::SwapPanes {
             other_block_id: string(object, "other_block_id")?.into(),
@@ -539,6 +555,8 @@ fn string<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
 #[must_use]
 pub fn defaults() -> Value {
     json!([{"name":"default","bindings":[
+        {"keys":["ctrl+shift+p"],"action":"client.palette.toggle"},
+        {"keys":["ctrl+shift+q"],"action":"client.quit"},
         {"keys":["ctrl+alt+left"],"action":"pane.focus","args":{"direction":"left"}},
         {"keys":["ctrl+alt+right"],"action":"pane.focus","args":{"direction":"right"}},
         {"keys":["ctrl+alt+up"],"action":"pane.focus","args":{"direction":"up"}},
@@ -582,6 +600,29 @@ mod tests {
             Arguments::Split => json!({"direction":"above"}),
             Arguments::Focus => json!({"direction":"up"}),
         }
+    }
+
+    #[test]
+    fn palette_and_quit_actions_have_configurable_valid_defaults() -> Result<()> {
+        for (name, expected, key) in [
+            (
+                "client.palette.toggle",
+                NativeAction::TogglePalette,
+                "ctrl+shift+p",
+            ),
+            ("client.quit", NativeAction::Quit, "ctrl+shift+q"),
+        ] {
+            assert_eq!(parse(name, &Value::Null)?, expected);
+            assert!(parse(name, &json!({"unexpected":true})).is_err());
+            assert!(
+                defaults()[0]["bindings"]
+                    .as_array()
+                    .context("bindings")?
+                    .iter()
+                    .any(|binding| binding["action"] == name && binding["keys"] == json!([key]))
+            );
+        }
+        Ok(())
     }
 
     #[test]

@@ -1,0 +1,2637 @@
+From 04f20eb161288d3bb9980533a3acc7180b7ea0c0 Mon Sep 17 00:00:00 2001
+From: Mitchell Hashimoto <m@mitchellh.com>
+Date: Wed, 21 Oct 2026 11:06:10 -0700
+Subject: [PATCH] terminal: snapshot Kitty graphics pixel payloads
+
+---
+ src/terminal/c/snapshot.zig                   |  11 +-
+ src/terminal/search/terminal.zig              |   2 +-
+ src/terminal/snapshot/kitty.zig               | 898 +++++++++++++++++-
+ src/terminal/snapshot/main.zig                |  18 +-
+ src/terminal/snapshot/record.zig              |   5 +
+ src/terminal/snapshot/snapshot.ksy            |  37 +-
+ src/terminal/snapshot/snapshot.zig            | 249 +++--
+ .../snapshot/testdata/kitty-alternate-v1.hex  |  21 +-
+ .../snapshot/testdata/kitty-animation-v1.hex  |  23 +-
+ .../snapshot/testdata/kitty-history-v1.hex    |  61 +-
+ .../testdata/kitty-incompressible-v1.hex      | 110 +++
+ .../testdata/kitty-payload-in-history-v1.hex  | 135 +++
+ .../snapshot/testdata/kitty-placed-v1.hex     |  13 +-
+ .../snapshot/testdata/kitty-relative-v1.hex   |  18 +-
+ .../testdata/kitty-source-rect-v1.hex         |  13 +-
+ .../snapshot/testdata/kitty-virtual-v1.hex    |  13 +-
+ .../snapshot/testdata/unknown-records-v1.hex  | 175 ++++
+ src/terminal/snapshot/verify-kaitai.py        |  74 +-
+ 18 files changed, 1701 insertions(+), 175 deletions(-)
+ create mode 100644 src/terminal/snapshot/testdata/kitty-incompressible-v1.hex
+ create mode 100644 src/terminal/snapshot/testdata/kitty-payload-in-history-v1.hex
+ create mode 100644 src/terminal/snapshot/testdata/unknown-records-v1.hex
+
+diff --git a/src/terminal/c/snapshot.zig b/src/terminal/c/snapshot.zig
+index 1188d4bc9..6ea5ab549 100644
+--- a/src/terminal/c/snapshot.zig
++++ b/src/terminal/c/snapshot.zig
+@@ -94,7 +94,7 @@ const DecoderWrapper = struct {
+         history: struct {
+             terminal: terminal_c.Terminal,
+             metadata: Metadata,
+-            progress: ?snapshot_core.Decoder.Progress = null,
++            progress: ?snapshot_core.Decoder.Progress.Page = null,
+         },
+ 
+         finished: Metadata,
+@@ -320,7 +320,7 @@ fn decoderMetadata(
+ /// Return page progress only during incremental history decoding.
+ fn decoderProgress(
+     decoder: *const DecoderWrapper,
+-) ?snapshot_core.Decoder.Progress {
++) ?snapshot_core.Decoder.Progress.Page {
+     return switch (decoder.state) {
+         .history => |value| value.progress,
+         else => null,
+@@ -406,8 +406,13 @@ pub fn decoder_next(
+     };
+ 
+     // Publish page progress, or transition permanently to validated FINISH.
++    // The C API reports page progress only. After an image record, the
++    // page getters report no value.
+     if (progress) |value| {
+-        history.progress = value;
++        history.progress = switch (value) {
++            .page => |page| page,
++            .image => null,
++        };
+         return .success;
+     }
+ 
+diff --git a/src/terminal/search/terminal.zig b/src/terminal/search/terminal.zig
+index 19f059c63..e10d2aa1c 100644
+--- a/src/terminal/search/terminal.zig
++++ b/src/terminal/search/terminal.zig
+@@ -722,7 +722,7 @@ test "feed after complete discovers prepended snapshot history" {
+     // Restore every history page below the live terminal.
+     var restored_pages: usize = 0;
+     while (try decoder.next(alloc, &t)) |progress| : (restored_pages += 1) {
+-        try testing.expect(progress.rows > 0);
++        try testing.expect(progress.page.rows > 0);
+     }
+     try testing.expect(restored_pages > 0);
+     try testing.expectEqual(
+diff --git a/src/terminal/snapshot/kitty.zig b/src/terminal/snapshot/kitty.zig
+index 616f4ad94..ecf044855 100644
+--- a/src/terminal/snapshot/kitty.zig
++++ b/src/terminal/snapshot/kitty.zig
+@@ -1,20 +1,22 @@
+-//! Kitty graphics records: the images, placements and in-progress chunked
+-//! load of each screen.
++//! Kitty graphics records: the images, pixels, placements and in-progress
++//! chunked load of each screen.
+ //!
+ //! A terminal's Kitty graphics live in one image storage per screen. These
+ //! records carry that storage through a snapshot, so a restored terminal
+ //! shows the same images in the same places:
+ //!
+-//! - KITTY_IMAGE_STORAGE holds one screen's images, its placements on the pages
+-//!   of its SCREEN sequence, and its in-progress chunked load, if any.
++//! - KITTY_IMAGE_STORAGE holds one screen's images, its placements on the
++//!   pages of its SCREEN sequence, and its in-progress chunked load, if any.
++//! - KITTY_IMAGE_PAYLOAD holds the pixels of one image or one animation frame.
+ //! - KITTY_IMAGE_PAGE_PLACEMENTS holds the placements pinned to one history
+ //!   page.
+ //!
+-//! Both are optional records. A decoder that does not know them, including
+-//! any build without Kitty graphics, skips them (see "Unknown Records" in
+-//! `record.zig`) and restores the same terminal without its images. They
+-//! are only written when there is something in them, so a terminal without
+-//! images encodes exactly as it did before these records existed.
++//! All of them are optional records. A decoder that does not know them,
++//! including any build without Kitty graphics, skips them (see "Unknown
++//! Records" in `record.zig`) and restores the same terminal without its
++//! images. They are only written when there is something in them, so a
++//! terminal without images encodes exactly as it did before these records
++//! existed.
+ //!
+ //! ## Where the Records Go
+ //!
+@@ -25,6 +27,9 @@
+ //! +--------------------------------+
+ //! | CONTINUATION, READY            |
+ //! +--------------------------------+
++//! | KITTY_IMAGE_PAYLOAD (optional) |  per image or frame, anywhere
++//! | ...                            |  from here to FINISH
++//! +--------------------------------+
+ //! | HISTORY                        |  per screen
+ //! | PAGE                           |
+ //! | KITTY_IMAGE_PAGE_PLACEMENTS    |  optional, after a PAGE with placements
+@@ -34,12 +39,13 @@
+ //! +--------------------------------+
+ //! ```
+ //!
+-//! KITTY_IMAGE_STORAGE comes before READY, so the terminal handed back at READY
+-//! already knows every image and where it is placed. A placement is pinned
+-//! to a cell of some page, and where its record goes depends on that page:
++//! KITTY_IMAGE_STORAGE comes before READY, so the terminal handed back at
++//! READY already knows every image and where it is placed. A placement is
++//! pinned to a cell of some page, and where its record goes depends on that
++//! page:
+ //!
+-//! - Pinned to a page of the SCREEN sequence: KITTY_IMAGE_STORAGE, which names
+-//!   the page by its position in that sequence.
++//! - Pinned to a page of the SCREEN sequence: KITTY_IMAGE_STORAGE, which
++//!   names the page by its position in that sequence.
+ //! - Pinned to a history page: the KITTY_IMAGE_PAGE_PLACEMENTS record right
+ //!   after that PAGE. If the decoder has to drop the page, it drops these
+ //!   placements with it.
+@@ -50,15 +56,14 @@
+ //!   relative itself, so this follows the parents up to the first one that
+ //!   is pinned or virtual, and uses its record.
+ //!
+-//! ## Images and Their Pixels
++//! ## Images
+ //!
+-//! KITTY_IMAGE_STORAGE describes each image, including its size, format and any
+-//! animation, but not its pixels. The decoder adds each image to storage as
+-//! a pending image (see `ImageStorage.PendingImage`), which reserves the
++//! KITTY_IMAGE_STORAGE describes each image, including its size, format and
++//! any animation, but not its pixels. The decoder adds each image to storage
++//! as a pending image (see `ImageStorage.PendingImage`), which reserves the
+ //! image's full size against the decoder's storage limit. Animation frames
+-//! are restored pending in the same way. Pixels are not part of the
+-//! snapshot yet, so restored images and frames stay pending and are not
+-//! drawn.
++//! are restored pending in the same way. A pending image can be placed and
++//! queried like any other image. It just isn't drawn yet.
+ //!
+ //! Images are written oldest first. The decoder adds them in that order, so
+ //! when the decoder's limit is smaller than the encoder's, older images are
+@@ -68,12 +73,40 @@
+ //! Image generations are never written. They are only meaningful within
+ //! one process, so the decoder stamps fresh ones as it adds each image.
+ //!
++//! ## Pixels
++//!
++//! The pixels come after READY, one KITTY_IMAGE_PAYLOAD record per image or
++//! frame, so a restored terminal can be shown before they arrive. Each
++//! payload names its screen and image, and completes that pending image or
++//! frame. An animation does not play until all of its frames have arrived.
++//!
++//! A payload may come anywhere after READY and before FINISH, in any order,
++//! with one exception: it never comes between a PAGE and that page's
++//! KITTY_IMAGE_PAGE_PLACEMENTS, which must follow the page directly. This
++//! leaves encoders free to choose the order. One could send each image's
++//! pixels right after the history page that first shows it, for example, so
++//! that large images deep in scrollback don't hold up recent history.
++//!
++//! This encoder writes all payloads right after READY, one screen at a
++//! time, so that what is on screen fills in first: images placed in the
++//! viewport, then the other images oldest first, then animation frames in
++//! the same order.
++//!
++//! Live input may delete an image before its payload arrives, or send a
++//! new image with the same ID. The payload is then dropped rather than
++//! attached to whatever image now has that ID.
++//!
++//! Payloads are compressed with zlib. Every terminal that supports Kitty
++//! graphics can already inflate zlib, because the protocol lets clients
++//! send compressed images (`o=z`), so a snapshot reader needs no extra
++//! decoder for them.
++//!
+ //! The in-progress load is the one place where image data comes before
+ //! READY. It carries every byte received so far, because the next chunk
+-//! from live input is appended to them. A snapshot taken partway through
+-//! a large transmission can therefore hold megabytes of image data in
+-//! KITTY_IMAGE_STORAGE. Snapshots taken mid-transmission are rare, so this cost
+-//! is accepted.
++//! from live input is appended to them. A snapshot taken partway through a
++//! large transmission can therefore hold megabytes of image data in
++//! KITTY_IMAGE_STORAGE. Snapshots taken mid-transmission are rare, so this
++//! cost is accepted.
+ //!
+ //! All integers are little-endian.
+ //!
+@@ -255,6 +288,34 @@
+ //! - Composition mode (u8): 0 alpha blend, 1 overwrite.
+ //! - Background color (u32).
+ //!
++//! ### KITTY_IMAGE_PAYLOAD
++//!
++//! ```text
++//!   0 +------------------------------------+
++//!     | Screen key (u16)                   |
++//!   2 +------------------------------------+
++//!     | Image ID (u32)                     |
++//!   6 +------------------------------------+
++//!     | Frame number (u32)                 |
++//!  10 +------------------------------------+
++//!     | Decoded byte length (u64)          |
++//!  18 +------------------------------------+
++//!     | Compression (u8)                   |
++//!  19 +------------------------------------+
++//!     | Bytes                              |
++//! end +------------------------------------+
++//! ```
++//!
++//! Frames are numbered as the Kitty graphics protocol numbers them. Frame 1
++//! is the image itself, so its decoded length is the image's decoded
++//! length. Frames 2 and up are animation frames, whose decoded length is
++//! width * height * 4.
++//!
++//! Compression is 0 for none, where the bytes are the pixels themselves, or
++//! 1 for zlib, where the bytes are a zlib stream that inflates to exactly
++//! the decoded length. Decoders must accept both. This encoder uses zlib
++//! unless it would not make the payload smaller.
++//!
+ //! ### KITTY_IMAGE_PAGE_PLACEMENTS
+ //!
+ //! ```text
+@@ -271,6 +332,8 @@ const std = @import("std");
+ const build_options = @import("terminal_options");
+ const assert = std.debug.assert;
+ const Allocator = std.mem.Allocator;
++const flate = std.compress.flate;
++const wuffs = @import("wuffs");
+ const io = @import("io.zig");
+ const record = @import("record.zig");
+ const terminal_kitty = @import("../kitty.zig");
+@@ -291,6 +354,10 @@ const Node = TerminalPageList.List.Node;
+ 
+ const log = std.log.scoped(.snapshot_kitty);
+ 
++/// Whether the encoder compresses pixel payloads. Tests turn this off to
++/// produce uncompressed payloads, which every decoder must also accept.
++var compress_payloads: bool = true;
++
+ /// Errors possible while encoding Kitty graphics records.
+ pub const EncodeError = Allocator.Error || record.Writer.FinishError;
+ 
+@@ -409,6 +476,23 @@ fn keyLessThan(lhs: PlacementKey, rhs: PlacementKey) bool {
+     return lhs.placement_id.id < rhs.placement_id.id;
+ }
+ 
++/// One KITTY_IMAGE_PAYLOAD record to encode.
++const PlannedPayload = struct {
++    image: *const Image,
++
++    /// The frame number, as the Kitty graphics protocol counts frames. 1 is
++    /// the image itself and 2 and up are its animation frames.
++    frame: u32,
++
++    /// The pixels to encode.
++    fn bytes(self: PlannedPayload) []const u8 {
++        return switch (self.frame) {
++            1 => self.image.data.bytes().?,
++            else => self.image.animation.?.frames.items[self.frame - 2].data,
++        };
++    }
++};
++
+ /// `ScreenPlan` in builds with Kitty graphics, otherwise `void`, so callers
+ /// can name the type unconditionally.
+ pub const Plan = if (build_options.kitty_graphics) ScreenPlan else void;
+@@ -419,9 +503,13 @@ pub const Plan = if (build_options.kitty_graphics) ScreenPlan else void;
+ /// Encoding a screen's Kitty graphics takes more than one pass over its
+ /// storage. Images must be written oldest first, and placements must be
+ /// sorted so parents come before children and split by the page they are
+-/// pinned to. The plan does that work up front. The snapshot encoder then
+-/// calls `encodeStorage` after the screen's SCREEN records, and the HISTORY
+-/// encoder calls `encodePagePlacements` after each history page.
++/// pinned to. Pixel payloads are ordered so that images in the viewport
++/// come first. The plan does that work up front, and then writes each
++/// record where it belongs:
++///
++/// - `encodeStorage` right after the screen's SCREEN records.
++/// - `encodePayloads` after READY.
++/// - `encodePagePlacements` right after each history page.
+ ///
+ /// `init` returns null when the screen has no images and no in-progress
+ /// load. The snapshot then has no Kitty graphics records for that screen at
+@@ -432,6 +520,8 @@ pub const Plan = if (build_options.kitty_graphics) ScreenPlan else void;
+ /// var plan = (try kitty.ScreenPlan.init(alloc, screen, .primary)) orelse return;
+ /// defer plan.deinit();
+ /// try plan.encodeStorage(&stream);
++/// // ... after READY ...
++/// try plan.encodePayloads(&stream);
+ /// // ... later, while encoding HISTORY ...
+ /// try plan.encodePagePlacements(history_page, &stream);
+ /// ```
+@@ -460,6 +550,9 @@ pub const ScreenPlan = struct {
+     /// page list. Pages before it are history. See `RootPin.ordinal`.
+     first_resident: u32,
+ 
++    /// KITTY_IMAGE_PAYLOAD records, in the order they are written.
++    payloads: []PlannedPayload,
++
+     /// Plan the Kitty graphics records for `screen`, which the snapshot
+     /// names `key`. Returns null if there is nothing to encode. The plan
+     /// points into the screen's storage, so the screen must not change
+@@ -535,6 +628,14 @@ pub const ScreenPlan = struct {
+         std.sort.pdq(PlannedPlacement, resident.items, {}, residentLessThan);
+         std.sort.pdq(PlannedPlacement, history.items, {}, historyLessThan);
+ 
++        const payloads = try planPayloads(
++            alloc,
++            screen,
++            images,
++            resident.items,
++        );
++        errdefer alloc.free(payloads);
++
+         const resident_slice = try resident.toOwnedSlice(alloc);
+         errdefer alloc.free(resident_slice);
+         const history_slice = try history.toOwnedSlice(alloc);
+@@ -548,6 +649,7 @@ pub const ScreenPlan = struct {
+             .history = history_slice,
+             .history_next = 0,
+             .first_resident = first_resident,
++            .payloads = payloads,
+         };
+     }
+ 
+@@ -556,6 +658,7 @@ pub const ScreenPlan = struct {
+         self.alloc.free(self.images);
+         self.alloc.free(self.resident);
+         self.alloc.free(self.history);
++        self.alloc.free(self.payloads);
+         self.* = undefined;
+     }
+ 
+@@ -659,6 +762,81 @@ pub const ScreenPlan = struct {
+         try destination.finish();
+     }
+ 
++    /// Plan a payload for every image and frame whose pixels are present.
++    /// Images placed in the viewport come first, then the rest oldest
++    /// first. Animation frames follow, in the same image order.
++    fn planPayloads(
++        alloc: Allocator,
++        screen: *const TerminalScreen,
++        images: []const *const Image,
++        resident: []const PlannedPlacement,
++    ) Allocator.Error![]PlannedPayload {
++        var visible: std.AutoHashMapUnmanaged(u32, void) = .empty;
++        defer visible.deinit(alloc);
++        for (resident) |planned| {
++            const root = planned.root orelse {
++                // A virtual placement is drawn wherever its placeholder
++                // characters are, which is usually on screen.
++                try visible.put(alloc, planned.key.image_id, {});
++                continue;
++            };
++            const pin: TerminalPageList.Pin = .{
++                .node = root.node,
++                .y = root.y,
++                .x = root.x,
++            };
++            if (screen.pages.pointFromPin(.viewport, pin) != null) {
++                try visible.put(alloc, planned.key.image_id, {});
++            }
++        }
++
++        var result: std.ArrayList(PlannedPayload) = .empty;
++        errdefer result.deinit(alloc);
++        for ([_]bool{ true, false }) |want_visible| {
++            for (images) |img| {
++                if (visible.contains(img.id) != want_visible) continue;
++                if (img.data.isPending()) continue;
++                try result.append(alloc, .{ .image = img, .frame = 1 });
++            }
++        }
++        for ([_]bool{ true, false }) |want_visible| {
++            for (images) |img| {
++                if (visible.contains(img.id) != want_visible) continue;
++                const anim = img.animation orelse continue;
++                for (anim.frames.items, 2..) |frame, number| {
++                    if (frame.isPending()) continue;
++                    try result.append(alloc, .{
++                        .image = img,
++                        .frame = @intCast(number),
++                    });
++                }
++            }
++        }
++        return result.toOwnedSlice(alloc);
++    }
++
++    /// Encode a KITTY_IMAGE_PAYLOAD record for each image and frame with
++    /// pixels, or nothing when there are none. Call this after READY.
++    pub fn encodePayloads(
++        self: *const ScreenPlan,
++        destination: *record.Writer,
++    ) EncodeError!void {
++        if (self.payloads.len == 0) return;
++
++        // The compressor is too large for the stack, so allocate it once
++        // and reuse it for every payload of this screen.
++        var compressor: ?*Compressor = null;
++        defer if (compressor) |c| self.alloc.destroy(c);
++        if (compress_payloads) compressor = try self.alloc.create(Compressor);
++
++        for (self.payloads) |payload| try encodePayload(
++            destination,
++            compressor,
++            self.key,
++            payload,
++        );
++    }
++
+     /// Encode the KITTY_IMAGE_PAGE_PLACEMENTS record for one history page, if
+     /// any placement is pinned to it, and nothing otherwise. Call this right
+     /// after the page's PAGE record. Pages must be visited newest first, in
+@@ -866,9 +1044,94 @@ fn decodeCompression(raw: u8) ?Compression {
+     };
+ }
+ 
++/// Deflate state for compressing payloads.
++const Compressor = struct {
++    window: [flate.max_window_len]u8,
++    state: flate.Compress,
++};
++
++/// The offset of the compression byte in a KITTY_IMAGE_PAYLOAD record.
++const payload_compression_offset = 18;
++
++/// The number of KITTY_IMAGE_PAYLOAD bytes before the pixel bytes.
++const payload_header_len = payload_compression_offset + 1;
++
++/// Encode one KITTY_IMAGE_PAYLOAD record. With a compressor, the pixels are
++/// compressed, unless that would not make them smaller.
++fn encodePayload(
++    destination: *record.Writer,
++    compressor: ?*Compressor,
++    key: TerminalScreenKey,
++    payload: PlannedPayload,
++) EncodeError!void {
++    const bytes = payload.bytes();
++    const writer = destination.begin(.kitty_image_payload);
++    errdefer destination.cancel();
++    try encodeKey(writer, key);
++    try io.writeInt(writer, u32, payload.image.id);
++    try io.writeInt(writer, u32, payload.frame);
++    try io.writeInt(writer, u64, bytes.len);
++    assert(writer.end == payload_compression_offset);
++
++    compressed: {
++        const c = compressor orelse break :compressed;
++        try writer.writeByte(encodeCompression(.zlib_deflate));
++
++        // The deflate encoder needs room for its output in the record's
++        // buffer.
++        try destination.scratch.ensureUnusedCapacity(64);
++        c.state = try flate.Compress.init(
++            writer,
++            &c.window,
++            .zlib,
++            .fastest,
++        );
++        try c.state.writer.writeAll(bytes);
++        try c.state.finish();
++
++        // Keep the compressed form only if it is actually smaller.
++        // Otherwise rewind to the compression byte and write the pixels
++        // as they are.
++        if (writer.end - payload_header_len < bytes.len) {
++            return destination.finish();
++        }
++        writer.end = payload_compression_offset;
++    }
++
++    try writer.writeByte(encodeCompression(.none));
++    try writer.writeAll(bytes);
++    try destination.finish();
++}
++
+ // ---------------------------------------------------------------------------
+ // Decoding
+ 
++/// The Kitty graphics a screen had when the snapshot reached READY. See
++/// `snapshot.Decoded.kitty` for how to show progress with it.
++pub const Counts = struct {
++    /// Images restored into the screen's storage.
++    images: u32 = 0,
++
++    /// Bytes of image and frame pixels that have not arrived yet.
++    pending_bytes: u64 = 0,
++
++    /// Count the images in `storage` and the bytes of their pixels that
++    /// are still pending.
++    pub fn init(storage: *const ImageStorage) Counts {
++        var result: Counts = .{};
++        var it = storage.images.valueIterator();
++        while (it.next()) |img| {
++            result.images += 1;
++            if (img.data.isPending()) result.pending_bytes += img.data.len();
++            const anim = img.animation orelse continue;
++            for (anim.frames.items) |frame| {
++                if (frame.isPending()) result.pending_bytes += frame.pending_len;
++            }
++        }
++        return result;
++    }
++};
++
+ /// Decode one KITTY_IMAGE_STORAGE record into `screen`.
+ ///
+ /// `record_header` is the record's header, already read from `source`. A
+@@ -1409,6 +1672,192 @@ fn decodeLoading(
+     storage.loading = result;
+ }
+ 
++/// A screen that KITTY_IMAGE_PAYLOAD records may complete images on. See
++/// `decodePayload`.
++pub const PayloadTarget = struct {
++    /// The screen restored at READY.
++    screen: *TerminalScreen,
++
++    /// The screen's image storage `generation` at READY. An image whose
++    /// `transmission` is newer than this was sent by live input after
++    /// READY, and only shares an ID with the snapshot's image. See
++    /// `PageTarget.ready_generation`.
++    ready_generation: u64,
++};
++
++/// The screens that KITTY_IMAGE_PAYLOAD records may complete images on, by
++/// screen key. See `decodePayload`.
++pub const PayloadTargets = std.EnumMap(TerminalScreenKey, PayloadTarget);
++
++/// What one KITTY_IMAGE_PAYLOAD record held.
++pub const Payload = struct {
++    /// The screen the record names.
++    key: TerminalScreenKey,
++
++    /// The image the pixels are for.
++    image_id: u32,
++
++    /// The frame number, as the Kitty graphics protocol counts frames. 1 is
++    /// the image itself and 2 and up are its animation frames.
++    frame: u32,
++
++    /// The number of pixel bytes attached to the image, or zero when the
++    /// payload was dropped.
++    bytes: usize,
++};
++
++/// Decode one KITTY_IMAGE_PAYLOAD record and attach its pixels to the pending
++/// image or animation frame they belong to.
++///
++/// `record_header` is the record's header, already read from `source`. A
++/// header for any other kind of record returns `error.UnexpectedRecordTag`.
++/// See "Decoding Records" in `record.zig`.
++///
++/// The record names its own screen, and `targets` gives the screen to use
++/// for each key. Leave out a screen that is gone, because live input
++/// removed it or replaced it with a new one since READY. The result
++/// reports the record's screen in `key`, so the caller can check that the
++/// snapshot declared it.
++///
++/// The pixels are attached only if `targets` has the record's screen, that
++/// screen still has the image the snapshot restored, and the image or
++/// frame is still pending with the same length. Otherwise the record is
++/// read and checked but its pixels are dropped, and the result reports
++/// zero bytes. A compressed payload that does not inflate to exactly the
++/// declared length is dropped the same way.
++///
++/// ```zig
++/// var targets: kitty.PayloadTargets = .init(.{});
++/// targets.put(.primary, .{
++///     .screen = primary,
++///     .ready_generation = primary_generation_at_ready,
++/// });
++///
++/// const header = try record.nextHeader(source);
++/// if (header.tag == .kitty_image_payload) {
++///     const payload = try kitty.decodePayload(source, header, io, alloc, targets);
++///     if (payload.key != .primary) return error.UnexpectedKittyKey;
++/// }
++/// ```
++pub fn decodePayload(
++    source: *std.Io.Reader,
++    record_header: record.Header,
++    io_: std.Io,
++    alloc: Allocator,
++    targets: PayloadTargets,
++) DecodeError!Payload {
++    var record_reader: record.Reader = undefined;
++    record_reader.initHeader(source, record_header);
++    if (record_header.tag != .kitty_image_payload) return error.UnexpectedRecordTag;
++
++    const reader = record_reader.payloadReader();
++    const key = try decodeKey(reader);
++    const image_id = try io.readInt(reader, u32);
++    const frame = try io.readInt(reader, u32);
++    const decoded_len = try io.readInt(reader, u64);
++    const compression = decodeCompression(try reader.takeByte());
++    const target = targets.get(key);
++
++    var result: Payload = .{
++        .key = key,
++        .image_id = image_id,
++        .frame = frame,
++        .bytes = 0,
++    };
++
++    // Find the pending image or frame these pixels complete, and the
++    // ticket to complete it with.
++    const ticket: ?ImageStorage.PendingImage = ticket: {
++        const t = target orelse break :ticket null;
++        if (compression == null) break :ticket null;
++        const img = t.screen.kitty_images.images.getPtr(image_id) orelse
++            break :ticket null;
++        if (img.transmission > t.ready_generation) break :ticket null;
++        const expected: usize = switch (frame) {
++            0 => break :ticket null,
++            1 => switch (img.data) {
++                .pending => |len| len,
++                .complete => break :ticket null,
++            },
++            else => expected: {
++                const anim = img.animation orelse break :ticket null;
++                if (frame - 2 >= anim.frames.items.len) break :ticket null;
++                const pending = anim.frames.items[frame - 2];
++                if (!pending.isPending()) break :ticket null;
++                break :expected pending.pending_len;
++            },
++        };
++        if (expected != decoded_len) break :ticket null;
++        break :ticket .{ .id = image_id, .transmission = img.transmission };
++    };
++    const pending = ticket orelse {
++        _ = try reader.discardRemaining();
++        try record_reader.finish();
++        return result;
++    };
++
++    const len: usize = @intCast(decoded_len);
++    const data: []u8 = switch (compression.?) {
++        .none => data: {
++            const data = try alloc.alloc(u8, len);
++            errdefer alloc.free(data);
++            try reader.readSliceAll(data);
++            break :data data;
++        },
++        .zlib_deflate => try inflate(
++            alloc,
++            reader,
++            record_header.payload_len - payload_header_len,
++            len,
++        ) orelse {
++            try record_reader.finish();
++            return result;
++        },
++    };
++    var owned = true;
++    defer if (owned) alloc.free(data);
++    try record_reader.finish();
++
++    const storage = &target.?.screen.kitty_images;
++    const attached = switch (frame) {
++        1 => pending.complete(storage, io_, data),
++        else => pending.completeFrame(storage, io_, frame, data),
++    };
++    if (attached) {
++        owned = false;
++        result.bytes = data.len;
++    }
++    return result;
++}
++
++/// Read `compressed_len` bytes of zlib stream from `reader` and inflate
++/// them. Returns the pixels, which the caller owns, or null when the stream
++/// is corrupt or does not inflate to exactly `len` bytes.
++///
++/// This uses the same zlib decoder as Kitty graphics transmissions with
++/// compression (`o=z`), so a build that can show Kitty images needs no
++/// other decoder for snapshots.
++fn inflate(
++    alloc: Allocator,
++    reader: *std.Io.Reader,
++    compressed_len: usize,
++    len: usize,
++) DecodeError!?[]u8 {
++    const compressed = try alloc.alloc(u8, compressed_len);
++    defer alloc.free(compressed);
++    try reader.readSliceAll(compressed);
++
++    const data = wuffs.zlib.decode(alloc, compressed, len, len) catch |err| switch (err) {
++        error.OutOfMemory => return error.OutOfMemory,
++        error.WuffsError, error.Overflow => return null,
++    };
++    if (data.len != len) {
++        alloc.free(data);
++        return null;
++    }
++    return data;
++}
++
+ /// The history page a KITTY_IMAGE_PAGE_PLACEMENTS record restores placements
+ /// onto. See `decodePagePlacements`.
+ pub const PageTarget = struct {
+@@ -1490,6 +1939,7 @@ const testing = std.testing;
+ const test_fixture = @import("fixture.zig");
+ const snapshot = @import("snapshot.zig");
+ const Terminal = @import("../Terminal.zig");
++const RenderState = @import("../render.zig").RenderState;
+ 
+ /// A small terminal with pixel geometry, so placement sizes are nonzero.
+ fn testTerminal(cols: u16, rows: u16) !Terminal {
+@@ -1565,11 +2015,7 @@ const test_decode_options: snapshot.DecodeOptions = .{
+ };
+ 
+ /// Require two screens' Kitty graphics storage to hold the same images,
+-/// placements and in-progress load, with the same render geometry.
+-///
+-/// KITTY_IMAGE_STORAGE restores images and frames without their pixels, so the
+-/// restored side may be pending where the original is complete. Its size
+-/// must still match, and pixels that are present must be identical.
++/// pixels, placements and in-progress load, with the same render geometry.
+ fn expectStorageEqual(
+     expected_terminal: *const Terminal,
+     actual_terminal: *const Terminal,
+@@ -1597,8 +2043,9 @@ fn expectStorageEqual(
+         try testing.expectEqual(e.format, a.format);
+         try testing.expectEqual(e.metadata, a.metadata);
+         try testing.expectEqual(e.data.len(), a.data.len());
+-        if (a.data.bytes()) |bytes| {
+-            try testing.expectEqualSlices(u8, e.data.bytes().?, bytes);
++        try testing.expectEqual(e.data.isPending(), a.data.isPending());
++        if (e.data.bytes()) |bytes| {
++            try testing.expectEqualSlices(u8, bytes, a.data.bytes().?);
+         }
+ 
+         try testing.expectEqual(e.animation == null, a.animation == null);
+@@ -1612,10 +2059,8 @@ fn expectStorageEqual(
+         try testing.expectEqual(e_anim.frames.items.len, a_anim.frames.items.len);
+         for (e_anim.frames.items, a_anim.frames.items) |ef, af| {
+             try testing.expectEqual(ef.gap_ms, af.gap_ms);
+-            try testing.expectEqual(ef.storageSize(), af.storageSize());
+-            if (!af.isPending()) {
+-                try testing.expectEqualSlices(u8, ef.data, af.data);
+-            }
++            try testing.expectEqual(ef.pending_len, af.pending_len);
++            try testing.expectEqualSlices(u8, ef.data, af.data);
+         }
+     }
+ 
+@@ -1929,6 +2374,26 @@ test "golden snapshot with an in-progress chunked load" {
+     try testGolden(&t, "kitty-loading", &test_loading_fixture);
+ }
+ 
++const test_incompressible_fixture = test_fixture.parse(@embedFile("testdata/kitty-incompressible-v1.hex"));
++
++test "golden snapshot with a payload deflate cannot shrink" {
++    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
++    var t = try testTerminal(4, 2);
++    defer t.deinit(testing.allocator);
++
++    var pixels: [64]u8 = undefined;
++    var prng: std.Random.DefaultPrng = .init(0x5eed);
++    prng.random().bytes(&pixels);
++    try testCommand(&t, "a=T,f=32,s=4,v=4,i=7,C=1,q=2", &pixels);
++    try testGolden(&t, "kitty-incompressible", &test_incompressible_fixture);
++
++    // The payload is stored uncompressed, right after its compression byte.
++    const fixture: []const u8 = &test_incompressible_fixture;
++    const index = std.mem.indexOf(u8, fixture, &pixels) orelse
++        return error.TestUnexpectedResult;
++    try testing.expectEqual(@as(u8, 0), fixture[index - 1]);
++}
++
+ const test_alternate_fixture = test_fixture.parse(@embedFile("testdata/kitty-alternate-v1.hex"));
+ 
+ test "golden snapshot with an image on the alternate screen" {
+@@ -1971,6 +2436,7 @@ fn testRecords(bytes: []const u8) ![]TestRecord {
+ fn testIsKittyTag(tag: record.Tag) bool {
+     return switch (tag) {
+         .kitty_image_storage,
++        .kitty_image_payload,
+         .kitty_image_page_placements,
+         => true,
+         else => false,
+@@ -1992,6 +2458,27 @@ fn testStripKitty(bytes: []const u8) ![]u8 {
+     return result.toOwnedSlice(testing.allocator);
+ }
+ 
++/// The snapshot with an unknown record before every record, including
++/// before FINISH, so one appears in every position between records.
++fn testInsertUnknown(bytes: []const u8) ![]u8 {
++    const records = try testRecords(bytes);
++    defer testing.allocator.free(records);
++    var result: std.Io.Writer.Allocating = .init(testing.allocator);
++    errdefer result.deinit();
++    try result.writer.writeAll(bytes[0..records[0].start]);
++    for (records, 0..) |r, i| {
++        // Vary the tags and lengths, including an empty payload.
++        var payload: [8]u8 = @splat(@intCast(i));
++        try record.testWriteRaw(
++            &result.writer,
++            @intCast(0x4000 + i),
++            payload[0 .. i % payload.len],
++        );
++        try result.writer.writeAll(bytes[r.start..r.end]);
++    }
++    return result.toOwnedSlice();
++}
++
+ test "a terminal without images encodes no Kitty graphics records" {
+     var t = try testTerminal(4, 2);
+     defer t.deinit(testing.allocator);
+@@ -2027,6 +2514,7 @@ test "Kitty graphics records are skipped without Kitty graphics support" {
+         &test_history_fixture,
+         &test_animation_fixture,
+         &test_loading_fixture,
++        &test_incompressible_fixture,
+         &test_alternate_fixture,
+     };
+     for (fixtures) |fixture| {
+@@ -2049,6 +2537,63 @@ test "Kitty graphics records are skipped without Kitty graphics support" {
+     }
+ }
+ 
++const test_unknown_fixture = test_fixture.parse(@embedFile("testdata/unknown-records-v1.hex"));
++
++test "golden snapshot with an unknown record in every position" {
++    // The fixture is the history golden, which has Kitty graphics records
++    // of every kind, with unknown records interleaved everywhere.
++    const expected = try testInsertUnknown(&test_history_fixture);
++    defer testing.allocator.free(expected);
++    try test_fixture.expectEqual(
++        .snapshot,
++        "src/terminal/snapshot/testdata/unknown-records-v1.hex",
++        "snapshot_fixture-unknown-records-v1.hex",
++        &test_unknown_fixture,
++        expected,
++    );
++
++    // Unknown records are skipped wherever they appear.
++    var restored = try testDecode(&test_unknown_fixture, test_decode_options);
++    defer restored.deinit(testing.allocator);
++    const reencoded = try testEncode(&restored);
++    defer testing.allocator.free(reencoded);
++    if (comptime build_options.kitty_graphics) {
++        try testing.expectEqualSlices(u8, &test_history_fixture, reencoded);
++    } else {
++        const stripped = try testStripKitty(&test_history_fixture);
++        defer testing.allocator.free(stripped);
++        try testing.expectEqualSlices(u8, stripped, reencoded);
++    }
++
++    // The same holds for the incremental decoder.
++    {
++        var source_reader: std.Io.Reader = .fixed(&test_unknown_fixture);
++        var decoder: snapshot.Decoder = .init(&source_reader);
++        var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
++        defer decoded.deinit(testing.allocator);
++        var incremental = decoded.toOwned();
++        defer incremental.deinit(testing.allocator);
++        while (try decoder.next(testing.allocator, &incremental)) |_| {}
++        const incremental_bytes = try testEncode(&incremental);
++        defer testing.allocator.free(incremental_bytes);
++        try testing.expectEqualSlices(u8, reencoded, incremental_bytes);
++    }
++
++    // A corrupted unknown record still fails its CRC, in every position.
++    const records = try testRecords(&test_unknown_fixture);
++    defer testing.allocator.free(records);
++    for (records) |r| {
++        if (r.tag.known()) continue;
++        const corrupted = try testing.allocator.dupe(u8, &test_unknown_fixture);
++        defer testing.allocator.free(corrupted);
++        corrupted[r.start] ^= 0x01;
++        try testing.expectError(
++            error.InvalidChecksum,
++            testDecode(corrupted, test_decode_options),
++        );
++    }
++}
++
+ test "decode with a smaller limit keeps the newest images" {
+     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+     var t = try testTerminal(4, 3);
+@@ -2074,17 +2619,17 @@ test "decode with a smaller limit keeps the newest images" {
+     try testing.expectEqual(150, storage.total_limit);
+     try testing.expectEqual(2, storage.images.count());
+     try testing.expect(storage.imageById(1) == null);
+-    try testing.expect(storage.imageById(2).?.data.isPending());
+-    try testing.expect(storage.imageById(3).?.data.isPending());
++    try testing.expectEqualSlices(u8, &pixels, storage.imageById(2).?.data.bytes().?);
++    try testing.expectEqualSlices(u8, &pixels, storage.imageById(3).?.data.bytes().?);
+ 
+     // The placement of the dropped image and its relative child are gone.
+-    // The two kept images still reserve their full size.
+     try testing.expectEqual(2, storage.placements.count());
+     var it = storage.placements.keyIterator();
+     while (it.next()) |key| try testing.expect(key.image_id != 1);
+     try testing.expectEqual(128, storage.total_bytes);
+ 
+-    // A limit too small for any image keeps none.
++    // A limit too small for any image keeps none. The pixels for those
++    // images are then skipped without an error.
+     var empty = try testDecode(encoded, .{
+         .max_continuation_bytes = 0,
+         .kitty_image_storage_limit = 10,
+@@ -2094,6 +2639,88 @@ test "decode with a smaller limit keeps the newest images" {
+     try testing.expectEqual(0, empty.screens.active.kitty_images.total_bytes);
+ }
+ 
++test "incremental decode restores images at READY and payloads after" {
++    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
++    var t = try testAnimationTerminal();
++    defer t.deinit(testing.allocator);
++    try testCommand(&t, "a=T,f=32,s=8,v=8,i=9,C=1,q=2", &testPixels(256, .{ 3, 3, 3, 255 }));
++    const encoded = try testEncode(&t);
++    defer testing.allocator.free(encoded);
++
++    var source: std.Io.Reader = .fixed(encoded);
++    var decoder: snapshot.Decoder = .init(&source);
++    var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
++    defer decoded.deinit(testing.allocator);
++    var restored = decoded.toOwned();
++    defer restored.deinit(testing.allocator);
++
++    // At READY every image and placement exists, with pending pixels
++    // reserved against the limit, and the animation does not play.
++    const counts = decoded.kitty.get(.primary);
++    try testing.expectEqual(2, counts.images);
++    try testing.expectEqual(256 + 3 * 8, counts.pending_bytes);
++    try testing.expectEqual(0, decoded.kitty.get(.alternate).images);
++    const storage = &restored.screens.active.kitty_images;
++    try testing.expectEqual(t.screens.active.kitty_images.total_bytes, storage.total_bytes);
++    try testing.expect(storage.imageById(5).?.data.isPending());
++    try testing.expect(storage.imageById(5).?.renderData().isPending());
++    try testing.expect(storage.animationTick(testing.io, 0) == null);
++    try testing.expectEqual(2, storage.placements.count());
++
++    // Payloads arrive one per call: visible images first, oldest first,
++    // then animation frames.
++    const expected = [_]struct { id: u32, frame: u32, bytes: usize }{
++        .{ .id = 5, .frame = 1, .bytes = 8 },
++        .{ .id = 9, .frame = 1, .bytes = 256 },
++        .{ .id = 5, .frame = 2, .bytes = 8 },
++        .{ .id = 5, .frame = 3, .bytes = 8 },
++    };
++    for (expected, 0..) |e, i| {
++        const progress = (try decoder.next(testing.allocator, &restored)).?;
++        try testing.expectEqualDeep(snapshot.Decoder.Progress{ .image = .{
++            .key = .primary,
++            .image_id = e.id,
++            .frame = e.frame,
++            .bytes = e.bytes,
++        } }, progress);
++
++        // The animation waits for its last frame.
++        const playing = storage.animationTick(testing.io, 1000) != null;
++        try testing.expectEqual(i == expected.len - 1, playing);
++    }
++    try testing.expect(try decoder.next(testing.allocator, &restored) == null);
++    try expectStorageEqual(&t, &restored, .primary);
++}
++
++test "a payload for an image replaced after READY is dropped" {
++    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
++    var t = try testPlacedTerminal();
++    defer t.deinit(testing.allocator);
++    const encoded = try testEncode(&t);
++    defer testing.allocator.free(encoded);
++
++    var source: std.Io.Reader = .fixed(encoded);
++    var decoder: snapshot.Decoder = .init(&source);
++    var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
++    defer decoded.deinit(testing.allocator);
++    var restored = decoded.toOwned();
++    defer restored.deinit(testing.allocator);
++
++    // Live input sends a new image with the same ID before the payload
++    // arrives. The payload's pixels belong to the old image.
++    const live = testPixels(4, .{ 0, 0, 0, 255 });
++    try testCommand(&restored, "a=t,f=32,s=1,v=1,i=1,q=2", &live);
++
++    const progress = (try decoder.next(testing.allocator, &restored)).?.image;
++    try testing.expectEqual(1, progress.image_id);
++    try testing.expectEqual(0, progress.bytes);
++    try testing.expect(try decoder.next(testing.allocator, &restored) == null);
++
++    const storage = &restored.screens.active.kitty_images;
++    try testing.expectEqualSlices(u8, &live, storage.imageById(1).?.data.bytes().?);
++    try testing.expectEqual(4, storage.total_bytes);
++}
++
+ test "a dropped history page drops its placements" {
+     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+     var t = try testHistoryPlacedTerminal();
+@@ -2112,11 +2739,13 @@ test "a dropped history page drops its placements" {
+         const storage = &restored.screens.active.kitty_images;
+         try testing.expectEqual(1, storage.placements.count());
+ 
+-        // Each history page arrives with its placements.
+-        const newest = (try decoder.next(testing.allocator, restored)).?;
++        // The payload comes first, then each history page with its
++        // placements.
++        _ = (try decoder.next(testing.allocator, restored)).?.image;
++        const newest = (try decoder.next(testing.allocator, restored)).?.page;
+         try testing.expectEqual(2, newest.rows);
+         try testing.expectEqual(2, storage.placements.count());
+-        const oldest = (try decoder.next(testing.allocator, restored)).?;
++        const oldest = (try decoder.next(testing.allocator, restored)).?.page;
+         try testing.expectEqual(2, oldest.rows);
+         try testing.expectEqual(4, storage.placements.count());
+         try testing.expect(try decoder.next(testing.allocator, restored) == null);
+@@ -2136,7 +2765,11 @@ test "a dropped history page drops its placements" {
+ 
+         var pages: usize = 0;
+         while (try decoder.next(testing.allocator, &restored)) |progress| {
+-            try testing.expectEqual(0, progress.rows);
++            const page = switch (progress) {
++                .page => |page| page,
++                .image => continue,
++            };
++            try testing.expectEqual(0, page.rows);
+             pages += 1;
+         }
+         try testing.expectEqual(2, pages);
+@@ -2178,6 +2811,177 @@ test "a restored in-progress load continues the chunked transmission" {
+     try expectStorageEqual(&t, &restored, .primary);
+ }
+ 
++test "uncompressed and compressed payloads decode alike" {
++    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
++    var t = try testPlacedTerminal();
++    defer t.deinit(testing.allocator);
++
++    // Encode the same terminal with and without compression.
++    compress_payloads = false;
++    const uncompressed = testEncode(&t);
++    compress_payloads = true;
++    const plain = try uncompressed;
++    defer testing.allocator.free(plain);
++    const compressed = try testEncode(&t);
++    defer testing.allocator.free(compressed);
++    try testing.expect(plain.len > compressed.len);
++
++    for ([_][]const u8{ plain, compressed }) |bytes| {
++        var restored = try testDecode(bytes, test_decode_options);
++        defer restored.deinit(testing.allocator);
++        try expectStorageEqual(&t, &restored, .primary);
++
++        // Either way, the restored terminal encodes like any other.
++        const reencoded = try testEncode(&restored);
++        defer testing.allocator.free(reencoded);
++        try testing.expectEqualSlices(u8, compressed, reencoded);
++    }
++}
++
++test "a corrupt compressed payload is dropped" {
++    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
++    const records = try testRecords(&test_placed_fixture);
++    defer testing.allocator.free(records);
++    const payload = for (records) |r| {
++        if (r.tag == .kitty_image_payload) break r;
++    } else unreachable;
++
++    // Corrupt the zlib stream and fix up the record's CRC, so the record
++    // is valid but the stream inside it is not.
++    const corrupted = try testing.allocator.dupe(u8, &test_placed_fixture);
++    defer testing.allocator.free(corrupted);
++    const body = corrupted[payload.start + record.Header.len .. payload.end];
++    body[payload_header_len + 2] ^= 0xff;
++    var checksum: record.Checksum = .init(.kitty_image_payload, @intCast(body.len));
++    try checksum.writer().writeAll(body);
++    std.mem.writeInt(u32, corrupted[payload.start + 6 ..][0..4], checksum.final(), .little);
++
++    var restored = try testDecode(corrupted, test_decode_options);
++    defer restored.deinit(testing.allocator);
++    const img = restored.screens.active.kitty_images.imageById(1).?;
++    try testing.expect(img.data.isPending());
++}
++
++test "completing a placeholder image's payload updates the render state" {
++    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
++    var t = try testVirtualTerminal();
++    defer t.deinit(testing.allocator);
++    const encoded = try testEncode(&t);
++    defer testing.allocator.free(encoded);
++
++    var source: std.Io.Reader = .fixed(encoded);
++    var decoder: snapshot.Decoder = .init(&source);
++    var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
++    defer decoded.deinit(testing.allocator);
++    var restored = decoded.toOwned();
++    defer restored.deinit(testing.allocator);
++
++    var state: RenderState = .empty;
++    defer state.deinit(testing.allocator);
++
++    // The pending image draws nothing yet, even though its placeholder
++    // characters are on screen.
++    try state.update(testing.allocator, &restored);
++    var it = state.imagePlacementIterator();
++    try testing.expect(it.next() == null);
++
++    // The payload completes the image and changes the storage generation,
++    // so the next update looks at the placeholders again and finds the
++    // image.
++    const generation = restored.screens.active.kitty_images.generation;
++    const progress = (try decoder.next(testing.allocator, &restored)).?.image;
++    try testing.expectEqual(16, progress.bytes);
++    try testing.expect(restored.screens.active.kitty_images.generation != generation);
++    try state.update(testing.allocator, &restored);
++    it = state.imagePlacementIterator();
++    const placement = it.next().?;
++    try testing.expectEqual(3, placement.image_id);
++    try testing.expectEqual(2, placement.cols);
++    try testing.expect(it.next() == null);
++}
++
++/// `bytes` with its one KITTY_IMAGE_PAYLOAD record moved to just before the
++/// record at `position`, counted among the other records.
++fn testMovePayload(bytes: []const u8, position: usize) ![]u8 {
++    const records = try testRecords(bytes);
++    defer testing.allocator.free(records);
++    const payload = for (records) |r| {
++        if (r.tag == .kitty_image_payload) break r;
++    } else unreachable;
++
++    var result: std.Io.Writer.Allocating = .init(testing.allocator);
++    errdefer result.deinit();
++    try result.writer.writeAll(bytes[0..records[0].start]);
++    var index: usize = 0;
++    for (records) |r| {
++        if (r.tag == .kitty_image_payload) continue;
++        if (index == position) try result.writer.writeAll(bytes[payload.start..payload.end]);
++        try result.writer.writeAll(bytes[r.start..r.end]);
++        index += 1;
++    }
++    return result.toOwnedSlice();
++}
++
++const test_payload_in_history_fixture = test_fixture.parse(@embedFile("testdata/kitty-payload-in-history-v1.hex"));
++
++test "a payload may come anywhere after READY" {
++    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
++    var t = try testHistoryPlacedTerminal();
++    defer t.deinit(testing.allocator);
++    const encoded = try testEncode(&t);
++    defer testing.allocator.free(encoded);
++
++    // The positions of READY and FINISH among the records other than the
++    // payload.
++    var others: std.ArrayList(record.Tag) = .empty;
++    defer others.deinit(testing.allocator);
++    {
++        const records = try testRecords(encoded);
++        defer testing.allocator.free(records);
++        for (records) |r| {
++            if (r.tag != .kitty_image_payload) try others.append(testing.allocator, r.tag);
++        }
++    }
++    const ready = std.mem.indexOfScalar(record.Tag, others.items, .ready).?;
++    const finish = others.items.len - 1;
++    try testing.expectEqual(.finish, others.items[finish]);
++
++    // Try the payload in front of every record after READY, up to and
++    // including FINISH. Each restores the same terminal, except a payload
++    // between a PAGE and its KITTY_IMAGE_PAGE_PLACEMENTS, which is not
++    // allowed.
++    for (ready + 1..finish + 1) |position| {
++        const moved = try testMovePayload(encoded, position);
++        defer testing.allocator.free(moved);
++        if (others.items[position] == .kitty_image_page_placements) {
++            try testing.expectError(
++                error.UnexpectedRecordTag,
++                testDecode(moved, test_decode_options),
++            );
++            continue;
++        }
++
++        var restored = try testDecode(moved, test_decode_options);
++        defer restored.deinit(testing.allocator);
++        try expectStorageEqual(&t, &restored, .primary);
++    }
++
++    // A golden fixture with the payload between two history pages, so the
++    // schema check sees a payload inside HISTORY too.
++    const index = for (others.items, 0..) |tag, i| {
++        if (i > ready and tag == .page and others.items[i - 1] == .kitty_image_page_placements) break i;
++    } else unreachable;
++    const expected = try testMovePayload(encoded, index);
++    defer testing.allocator.free(expected);
++    try test_fixture.expectEqual(
++        .snapshot,
++        "src/terminal/snapshot/testdata/kitty-payload-in-history-v1.hex",
++        "snapshot_fixture-kitty-payload-in-history-v1.hex",
++        &test_payload_in_history_fixture,
++        expected,
++    );
++}
++
+ test "KITTY_IMAGE_STORAGE must belong to the screen before it" {
+     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+     var t = try testPlacedTerminal();
+diff --git a/src/terminal/snapshot/main.zig b/src/terminal/snapshot/main.zig
+index cdd8e3be4..976d53b16 100644
+--- a/src/terminal/snapshot/main.zig
++++ b/src/terminal/snapshot/main.zig
+@@ -57,6 +57,10 @@
+ //! +----------------------------------------+
+ //! | READY                                  |
+ //! +----------------------------------------+
++//! | KITTY_IMAGE_PAYLOAD (optional, per     |
++//! |   image or frame, anywhere until       |
++//! |   FINISH)                              |
++//! +----------------------------------------+
+ //! | HISTORY * terminal.screen_count        |
+ //! | PAGE * each history.page_count         |
+ //! | KITTY_IMAGE_PAGE_PLACEMENTS (optional, |
+@@ -66,8 +70,8 @@
+ //! +----------------------------------------+
+ //! ```
+ //!
+-//! The optional Kitty graphics records carry each screen's images and
+-//! placements. They are only written for screens that have images. See
++//! The optional Kitty graphics records carry each screen's images, pixels
++//! and placements. They are only written for screens that have images. See
+ //! `kitty.zig`.
+ //!
+ //! A decoder skips any record whose tag it does not know, wherever it
+@@ -162,11 +166,15 @@
+ //! defer terminal.deinit(alloc);
+ //!
+ //! // Render, replay the continuation, process input...
+-//! while (try decoder.next(alloc, &terminal)) |progress| {
+-//!     _ = progress; // Scrollback grew.
+-//! }
++//! while (try decoder.next(alloc, &terminal)) |progress| switch (progress) {
++//!     .image => {}, // An image's pixels arrived.
++//!     .page => {}, // Scrollback grew.
++//! };
+ //! ```
+ //!
++//! Kitty graphics images are restored at READY with their pixels pending.
++//! `next` then delivers the pixels, which may be mixed in with history.
++//!
+ //! ### Compressed History
+ //!
+ //! Decoded history is uncompressed by default, even if the encoded terminal
+diff --git a/src/terminal/snapshot/record.zig b/src/terminal/snapshot/record.zig
+index ac48a159d..0b49b307a 100644
+--- a/src/terminal/snapshot/record.zig
++++ b/src/terminal/snapshot/record.zig
+@@ -120,6 +120,10 @@ pub const Tag = enum(u16) {
+     /// load. Optional. See `kitty.zig`.
+     kitty_image_storage = 8,
+ 
++    /// The pixels of one Kitty graphics image or animation frame.
++    /// Optional. See `kitty.zig`.
++    kitty_image_payload = 9,
++
+     /// The Kitty graphics placements pinned to the history PAGE right
+     /// before this record. Optional. See `kitty.zig`.
+     kitty_image_page_placements = 10,
+@@ -150,6 +154,7 @@ pub const Tag = enum(u16) {
+             // A build without Kitty graphics skips these records and
+             // restores the terminal without its images.
+             .kitty_image_storage,
++            .kitty_image_payload,
+             .kitty_image_page_placements,
+             => build_options.kitty_graphics,
+ 
+diff --git a/src/terminal/snapshot/snapshot.ksy b/src/terminal/snapshot/snapshot.ksy
+index 906b1b428..af8cc5e2f 100644
+--- a/src/terminal/snapshot/snapshot.ksy
++++ b/src/terminal/snapshot/snapshot.ksy
+@@ -15,10 +15,11 @@ doc: |
+   this schema. Each SCREEN declares its complete logical history extent before
+   READY.
+ 
+-  Optional Kitty graphics records carry each screen's images and placements:
+-  KITTY_IMAGE_STORAGE right after a screen's SCREEN and PAGE records, and
+-  KITTY_IMAGE_PAGE_PLACEMENTS right after a history PAGE that has placements
+-  on it.
++  Optional Kitty graphics records carry each screen's images, pixels and
++  placements: KITTY_IMAGE_STORAGE right after a screen's SCREEN and PAGE
++  records, KITTY_IMAGE_PAGE_PLACEMENTS right after a history PAGE that has
++  placements on it, and KITTY_IMAGE_PAYLOAD records anywhere between READY
++  and FINISH, except between a PAGE and its KITTY_IMAGE_PAGE_PLACEMENTS.
+ 
+   A decoder skips every record whose tag it does not know, wherever it
+   appears, after checking its length and CRC32C. This lets newer encoders
+@@ -47,6 +48,7 @@ enums:
+     6: finish
+     7: continuation
+     8: kitty_image_storage
++    9: kitty_image_payload
+     10: kitty_image_page_placements
+   kitty_format:
+     0: rgb
+@@ -214,6 +216,7 @@ types:
+             3: page_payload
+             4: history_payload
+             8: kitty_image_storage_payload
++            9: kitty_image_payload_payload
+             10: kitty_image_page_placements_payload
+ 
+   record_header_any:
+@@ -1429,6 +1432,32 @@ types:
+         type: u4
+ 
+ 
++  kitty_image_payload_payload:
++    doc: |
++      The pixels of one image or animation frame. Frames are numbered as
++      the Kitty graphics protocol numbers them: frame 1 is the image itself
++      and frames 2 and up are its animation frames. Compressed data is a
++      zlib stream that inflates to exactly decoded_length bytes.
++    seq:
++      - id: key
++        type: u2
++        enum: screen_key
++        valid:
++          expr: _.to_i <= 1
++      - id: image_id
++        type: u4
++      - id: frame
++        type: u4
++        valid:
++          min: 1
++      - id: decoded_length
++        type: u8
++      - id: compression
++        type: u1
++        enum: kitty_compression
++      - id: data
++        size-eos: true
++
+   kitty_image_page_placements_payload:
+     doc: Placements pinned to the preceding history PAGE, parents first.
+     seq:
+diff --git a/src/terminal/snapshot/snapshot.zig b/src/terminal/snapshot/snapshot.zig
+index 63c2500fc..52de2d5b3 100644
+--- a/src/terminal/snapshot/snapshot.zig
++++ b/src/terminal/snapshot/snapshot.zig
+@@ -103,7 +103,17 @@ pub fn encode(
+     // 5. Ready marker.
+     try checkpoint.encode(.ready, &stream);
+ 
+-    // 6. Each screen's history, with the Kitty graphics placements pinned
++    // 6. Each screen's Kitty graphics pixels. They come after READY so
++    // the decoder can show the terminal without waiting for them.
++    if (comptime build_options.kitty_graphics) {
++        for (std.enums.values(TerminalScreenKey)) |key| {
++            if (kitty_plans.getPtr(key).*) |*plan| {
++                try plan.encodePayloads(&stream);
++            }
++        }
++    }
++
++    // 7. Each screen's history, with the Kitty graphics placements pinned
+     // to each page.
+     for (std.enums.values(TerminalScreenKey)) |key| {
+         const s = t.screens.get(key) orelse continue;
+@@ -116,7 +126,7 @@ pub fn encode(
+         );
+     }
+ 
+-    // 7. Finish
++    // 8. Finish
+     try checkpoint.encode(.finish, &stream);
+ }
+ 
+@@ -194,6 +204,29 @@ pub const Decoded = struct {
+     /// derived from the pages actually applied.
+     history_rows: std.EnumMap(TerminalScreenKey, u64),
+ 
++    /// For each screen, how many Kitty graphics images were restored and
++    /// how many bytes of their pixels are still to come through
++    /// `Decoder.next`. Screens without images, and every screen in a build
++    /// without Kitty graphics, report zeros.
++    ///
++    /// This is meant for showing progress while the pixels arrive:
++    ///
++    /// ```zig
++    /// const total = decoded.kitty.get(.primary).pending_bytes;
++    /// var received: u64 = 0;
++    /// while (try decoder.next(alloc, &terminal)) |progress| switch (progress) {
++    ///     .image => |image| if (image.key == .primary) {
++    ///         received += image.bytes;
++    ///     },
++    ///     .page => {},
++    /// };
++    /// ```
++    ///
++    /// Pixels that the decoder drops report zero bytes, so `received` can
++    /// end up below `total`. Pixels may arrive between history pages, so
++    /// they are only known to be done once `next` returns null.
++    kitty: std.EnumArray(TerminalScreenKey, kitty.Counts) = .initFill(.{}),
++
+     /// Destroy an untransferred Terminal and always free continuation bytes.
+     /// After `toOwned`, this leaves the caller-owned Terminal untouched.
+     pub fn deinit(self: *Decoded, alloc: Allocator) void {
+@@ -357,9 +390,10 @@ pub const Decoder = struct {
+     /// arrives through `next`. Asserts this is the first call.
+     ///
+     /// The Terminal also has every Kitty graphics image from the snapshot,
+-    /// and the placements on its screens. Image pixels are not in the
+-    /// snapshot yet, so the images are pending. Placements on history pages
+-    /// arrive with their pages through `next`.
++    /// and the placements on its screens. The pixels arrive later through
++    /// `next`, and the images are pending until then. Placements on history
++    /// pages also arrive through `next`, together with their pages.
++    /// `Decoded.kitty` says how many pixels are still to come.
+     pub fn ready(
+         self: *Decoder,
+         alloc: Allocator,
+@@ -481,16 +515,18 @@ pub const Decoder = struct {
+         // arrives.
+         var generations: std.EnumMap(TerminalScreenKey, usize) = .init(.{});
+         var kitty_generations: std.EnumMap(TerminalScreenKey, u64) = .init(.{});
++        var kitty_counts: std.EnumArray(TerminalScreenKey, kitty.Counts) = .initFill(.{});
+         var it = result.screens.all.iterator();
+         while (it.next()) |entry| {
+             generations.put(
+                 entry.key,
+                 result.screens.generation(entry.key),
+             );
+-            if (comptime build_options.kitty_graphics) kitty_generations.put(
+-                entry.key,
+-                entry.value.*.kitty_images.generation,
+-            );
++            if (comptime build_options.kitty_graphics) {
++                const storage = &entry.value.*.kitty_images;
++                kitty_generations.put(entry.key, storage.generation);
++                kitty_counts.set(entry.key, .init(storage));
++            }
+         }
+ 
+         self.state = .{ .history = .{
+@@ -506,20 +542,53 @@ pub const Decoder = struct {
+             .terminal = result,
+             .continuation = decoded_continuation,
+             .history_rows = history_rows,
++            .kitty = kitty_counts,
+         };
+     }
+ 
+-    /// One history PAGE record consumed by `next`.
+-    pub const Progress = struct {
+-        /// The screen whose HISTORY sequence contained the decoded page.
+-        key: TerminalScreenKey,
++    /// One record consumed by `next`.
++    ///
++    /// ```zig
++    /// while (try decoder.next(alloc, &terminal)) |progress| switch (progress) {
++    ///     .image => |image| log.debug("image {} arrived", .{image.image_id}),
++    ///     .page => |page| log.debug("{} rows of scrollback", .{page.rows}),
++    /// };
++    /// ```
++    pub const Progress = union(enum) {
++        /// A history PAGE, together with its Kitty graphics placements.
++        page: Page,
++
++        /// The pixels of a Kitty graphics image or animation frame.
++        image: Image,
++
++        pub const Page = struct {
++            /// The screen whose HISTORY contained the page.
++            key: TerminalScreenKey,
++
++            /// Rows prepended above that screen's existing content, or zero
++            /// when the page was consumed and validated but dropped.
++            rows: usize,
++
++            /// PAGE records still to come in the same HISTORY.
++            remaining: u32,
++        };
+ 
+-        /// Rows prepended above that screen's existing content, or zero
+-        /// when the page was consumed and validated but dropped.
+-        rows: usize,
++        pub const Image = struct {
++            /// The screen the image is on.
++            key: TerminalScreenKey,
+ 
+-        /// PAGE records still pending in the same HISTORY sequence.
+-        remaining: u32,
++            /// The ID of the image the pixels are for.
++            image_id: u32,
++
++            /// The frame the pixels are for, as the Kitty graphics protocol
++            /// counts frames. 1 is the image itself and 2 and up are its
++            /// animation frames.
++            frame: u32,
++
++            /// The number of pixel bytes attached to the image, or zero
++            /// when the pixels were consumed and validated but dropped.
++            bytes: usize,
++        };
+     };
+ 
+     /// Errors possible while decoding history records through FINISH.
+@@ -551,7 +620,8 @@ pub const Decoder = struct {
+             PageSizeOverflow,
+         };
+ 
+-    /// Decode one history PAGE record and prepend it to its screen in `t`.
++    /// Decode one history PAGE record and prepend it to its screen in `t`,
++    /// or decode the pixels of one Kitty graphics image or animation frame.
+     ///
+     /// `t` must be the Terminal restored by this decoder's `ready` call,
+     /// wherever the caller now stores it. Returns null once FINISH has
+@@ -579,6 +649,16 @@ pub const Decoder = struct {
+     /// The Kitty graphics placements pinned to a page are restored by the
+     /// same call as the page. When a page is dropped, its placements are
+     /// dropped too.
++    ///
++    /// Kitty graphics pixels may come at any point, even between history
++    /// pages, one image or frame per call. `next` reports them as
++    /// `Progress.image`. Like pages, they are never applied where they no
++    /// longer belong. The pixels are consumed but dropped, reported as zero
++    /// bytes, when:
++    ///
++    ///   * their screen was removed, or removed and recreated, since READY;
++    ///   * live input deleted the image, or sent a new image with the same
++    ///     ID, since READY.
+     pub fn next(
+         self: *Decoder,
+         alloc: Allocator,
+@@ -596,18 +676,26 @@ pub const Decoder = struct {
+         const state = &self.state.history;
+ 
+         while (true) {
++            // Read the next header before deciding how to decode the
++            // record. Unknown records before it were skipped.
++            const header = try self.takeHeader();
++
++            // Kitty graphics pixels may come anywhere after READY, even
++            // between the pages of a HISTORY sequence, in any screen order.
++            if (comptime build_options.kitty_graphics) {
++                if (header.tag == .kitty_image_payload) {
++                    return try self.nextPayload(alloc, t, header);
++                }
++            }
++
+             // Stream the current sequence's next PAGE if one remains.
+             if (state.current) |*sequence| {
+                 if (sequence.remaining > 0) {
+-                    return try self.nextPage(alloc, t, sequence);
++                    return try self.nextPage(alloc, t, sequence, header);
+                 }
+                 state.current = null;
+             }
+ 
+-            // Read the next header before deciding how to decode the
+-            // record. Unknown records before it were skipped.
+-            const header = try self.takeHeader();
+-
+             // All sequences are consumed: FINISH ends the snapshot, leaving
+             // trailing transport bytes unread.
+             if (state.pending == 0) {
+@@ -658,15 +746,74 @@ pub const Decoder = struct {
+         return try record.nextHeader(self.source);
+     }
+ 
+-    /// Consume one PAGE record from the current sequence, applying it to
+-    /// the live terminal when it is still applicable and discarding it
+-    /// otherwise. The page's Kitty graphics placements are restored with
+-    /// it, or dropped with it.
++    /// The screen for `key` in `t`, if it is still the screen restored at
++    /// READY. Returns null if live input removed it, or removed it and
++    /// created a new one, since then.
++    fn restoredScreen(
++        self: *const Decoder,
++        t: *Terminal,
++        key: TerminalScreenKey,
++    ) ?*TerminalScreen {
++        const state = &self.state.history;
++        const restored = t.screens.get(key) orelse return null;
++        if (t.screens.generation(key) != state.generations.get(key).?) {
++            return null;
++        }
++        return restored;
++    }
++
++    /// Consume one KITTY_IMAGE_PAYLOAD record, attaching its pixels to their
++    /// image when it is still the one restored at READY and dropping them
++    /// otherwise.
++    fn nextPayload(
++        self: *Decoder,
++        alloc: Allocator,
++        t: *Terminal,
++        header: record.Header,
++    ) NextError!Progress {
++        if (comptime !build_options.kitty_graphics) unreachable;
++        const state = &self.state.history;
++
++        // Pixels may go to any screen restored at READY that live input
++        // hasn't removed or replaced since.
++        var targets: kitty.PayloadTargets = .init(.{});
++        var it = state.generations.iterator();
++        while (it.next()) |entry| {
++            const restored = self.restoredScreen(t, entry.key) orelse continue;
++            targets.put(entry.key, .{
++                .screen = restored,
++                .ready_generation = state.kitty_generations.get(entry.key).?,
++            });
++        }
++
++        const payload = try kitty.decodePayload(
++            self.source,
++            header,
++            t.screens.active.io,
++            alloc,
++            targets,
++        );
++        if (state.generations.get(payload.key) == null) {
++            return error.UnexpectedKittyKey;
++        }
++        return .{ .image = .{
++            .key = payload.key,
++            .image_id = payload.image_id,
++            .frame = payload.frame,
++            .bytes = payload.bytes,
++        } };
++    }
++
++    /// Consume one PAGE record from the current sequence, whose header
++    /// `next` already read, applying it to the live terminal when it is
++    /// still applicable and discarding it otherwise. The page's Kitty
++    /// graphics placements are restored with it, or dropped with it.
+     fn nextPage(
+         self: *Decoder,
+         alloc: Allocator,
+         t: *Terminal,
+         sequence: *Sequence,
++        header: record.Header,
+     ) NextError!Progress {
+         const state = &self.state.history;
+ 
+@@ -675,18 +822,10 @@ pub const Decoder = struct {
+         const destination: ?*TerminalScreen = destination: {
+             if (!sequence.apply) break :destination null;
+             if (t.cols != state.cols) break :destination null;
+-            const restored = t.screens.get(sequence.key) orelse
+-                break :destination null;
+-            if (t.screens.generation(sequence.key) !=
+-                state.generations.get(sequence.key).?)
+-            {
+-                break :destination null;
+-            }
+-            break :destination restored;
++            break :destination self.restoredScreen(t, sequence.key);
+         };
+ 
+         sequence.remaining -= 1;
+-        const header = try self.takeHeader();
+         const applied: ?*TerminalScreen, const rows: usize = rows: {
+             const restored = destination orelse {
+                 // The record must still be consumed so decoding remains
+@@ -723,11 +862,11 @@ pub const Decoder = struct {
+             break :rows .{ restored, rows };
+         };
+ 
+-        const progress: Progress = .{
++        const progress: Progress = .{ .page = .{
+             .key = sequence.key,
+             .rows = rows,
+             .remaining = sequence.remaining,
+-        };
++        } };
+ 
+         // The page's Kitty graphics placements, if any, follow it. Read the
+         // next header to find out. Anything else waits for the next call,
+@@ -1994,20 +2133,20 @@ test "incremental decode restores a renderable terminal at READY" {
+ 
+     // Each call prepends exactly one history page, newest first.
+     const first = (try decoder.next(testing.allocator, &restored)).?;
+-    try testing.expectEqualDeep(Decoder.Progress{
++    try testing.expectEqualDeep(Decoder.Progress{ .page = .{
+         .key = .primary,
+         .rows = 2,
+         .remaining = 1,
+-    }, first);
++    } }, first);
+     try testing.expectEqual(5, primary.pages.scrollbar().total);
+     try testing.expectEqual(@as(u21, 'B'), testTopLeftCodepoint(primary));
+ 
+     const second = (try decoder.next(testing.allocator, &restored)).?;
+-    try testing.expectEqualDeep(Decoder.Progress{
++    try testing.expectEqualDeep(Decoder.Progress{ .page = .{
+         .key = .primary,
+         .rows = 2,
+         .remaining = 0,
+-    }, second);
++    } }, second);
+     try testing.expectEqual(7, primary.pages.scrollbar().total);
+     try testing.expectEqual(@as(u21, 'A'), testTopLeftCodepoint(primary));
+ 
+@@ -2079,8 +2218,8 @@ test "incremental decode applies history below live PTY output" {
+     // History still lands above both the snapshot content and the live
+     // output, preserving complete scrollback ordering.
+     while (try decoder.next(testing.allocator, &restored)) |progress| {
+-        try testing.expectEqual(TerminalScreenKey.primary, progress.key);
+-        try testing.expectEqual(2, progress.rows);
++        try testing.expectEqual(TerminalScreenKey.primary, progress.page.key);
++        try testing.expectEqual(2, progress.page.rows);
+     }
+     try testing.expectEqual(live_total + 4, primary.pages.scrollbar().total);
+     try testing.expectEqual(@as(u21, 'A'), testTopLeftCodepoint(primary));
+@@ -2154,8 +2293,8 @@ test "incremental decode discards history for screens changed since READY" {
+         const restored = &decoded.terminal.?;
+ 
+         const progress = (try decoder.next(testing.allocator, restored)).?;
+-        try testing.expectEqual(TerminalScreenKey.alternate, progress.key);
+-        try testing.expect(progress.rows > 0);
++        try testing.expectEqual(TerminalScreenKey.alternate, progress.page.key);
++        try testing.expect(progress.page.rows > 0);
+         try testing.expect(try decoder.next(testing.allocator, restored) == null);
+         try testing.expectEqual(
+             @as(usize, 2),
+@@ -2178,11 +2317,11 @@ test "incremental decode discards history for screens changed since READY" {
+         restored.screens.remove(testing.allocator, .alternate);
+ 
+         const progress = (try decoder.next(testing.allocator, restored)).?;
+-        try testing.expectEqualDeep(Decoder.Progress{
++        try testing.expectEqualDeep(Decoder.Progress{ .page = .{
+             .key = .alternate,
+             .rows = 0,
+             .remaining = 0,
+-        }, progress);
++        } }, progress);
+         try testing.expect(try decoder.next(testing.allocator, restored) == null);
+     }
+ 
+@@ -2202,8 +2341,8 @@ test "incremental decode discards history for screens changed since READY" {
+         _ = try restored.switchScreen(.alternate);
+ 
+         const progress = (try decoder.next(testing.allocator, restored)).?;
+-        try testing.expectEqual(TerminalScreenKey.alternate, progress.key);
+-        try testing.expectEqual(0, progress.rows);
++        try testing.expectEqual(TerminalScreenKey.alternate, progress.page.key);
++        try testing.expectEqual(0, progress.page.rows);
+         try testing.expect(try decoder.next(testing.allocator, restored) == null);
+         try testing.expectEqual(
+             @as(usize, 1),
+@@ -2240,8 +2379,8 @@ test "incremental decode discards history after a resize" {
+ 
+     var pages: usize = 0;
+     while (try decoder.next(testing.allocator, &restored)) |progress| {
+-        try testing.expectEqual(TerminalScreenKey.primary, progress.key);
+-        try testing.expectEqual(0, progress.rows);
++        try testing.expectEqual(TerminalScreenKey.primary, progress.page.key);
++        try testing.expectEqual(0, progress.page.rows);
+         pages += 1;
+     }
+     try testing.expectEqual(2, pages);
+@@ -2278,7 +2417,7 @@ test "decode drops history beyond the declared scrollback limits" {
+         var rows: [3]usize = undefined;
+         var pages: usize = 0;
+         while (try decoder.next(testing.allocator, restored)) |progress| {
+-            rows[pages] = progress.rows;
++            rows[pages] = progress.page.rows;
+             pages += 1;
+         }
+         try testing.expectEqual(3, pages);
+@@ -2332,7 +2471,7 @@ test "incremental decode failure leaves applied history usable" {
+ 
+     for (0..2) |_| {
+         const progress = (try decoder.next(testing.allocator, &restored)).?;
+-        try testing.expectEqual(2, progress.rows);
++        try testing.expectEqual(2, progress.page.rows);
+     }
+     try testing.expectError(
+         error.EndOfStream,
+diff --git a/src/terminal/snapshot/testdata/kitty-alternate-v1.hex b/src/terminal/snapshot/testdata/kitty-alternate-v1.hex
+index 6996ea48c..73aef1645 100644
+--- a/src/terminal/snapshot/testdata/kitty-alternate-v1.hex
++++ b/src/terminal/snapshot/testdata/kitty-alternate-v1.hex
+@@ -115,11 +115,20 @@ ee ee 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000037a
+ # offset 0x00000556: ready record, payload 0 bytes
+ 05 00 00 00 00 00 e4 20 ef 0a # 0x00000556
+ 
+-# offset 0x00000560: history record, payload 6 bytes
+-04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x00000560
++# offset 0x00000560: kitty_image_payload record, payload 23 bytes
++09 00 17 00 00 00 80 bf e2 22 00 00 01 00 00 00 # 0x00000560
++01 00 00 00 04 00 00 00 00 00 00 00 00 01 01 01 # 0x00000570
++ff # 0x00000580
+ 
+-# offset 0x00000570: history record, payload 6 bytes
+-04 00 06 00 00 00 b8 7a ba b1 01 00 00 00 00 00 # 0x00000570
++# offset 0x00000581: kitty_image_payload record, payload 22 bytes
++09 00 16 00 00 00 4b 77 23 28 01 00 01 00 00 00 # 0x00000581
++01 00 00 00 03 00 00 00 00 00 00 00 00 02 02 02 # 0x00000591
+ 
+-# offset 0x00000580: finish record, payload 0 bytes
+-06 00 00 00 00 00 3e eb 53 3e # 0x00000580
++# offset 0x000005a1: history record, payload 6 bytes
++04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x000005a1
++
++# offset 0x000005b1: history record, payload 6 bytes
++04 00 06 00 00 00 b8 7a ba b1 01 00 00 00 00 00 # 0x000005b1
++
++# offset 0x000005c1: finish record, payload 0 bytes
++06 00 00 00 00 00 3e eb 53 3e # 0x000005c1
+diff --git a/src/terminal/snapshot/testdata/kitty-animation-v1.hex b/src/terminal/snapshot/testdata/kitty-animation-v1.hex
+index 9ff1adbe6..ac1dc8827 100644
+--- a/src/terminal/snapshot/testdata/kitty-animation-v1.hex
++++ b/src/terminal/snapshot/testdata/kitty-animation-v1.hex
+@@ -98,8 +98,23 @@ ee ee 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000037a
+ # offset 0x000004af: ready record, payload 0 bytes
+ 05 00 00 00 00 00 e4 20 ef 0a # 0x000004af
+ 
+-# offset 0x000004b9: history record, payload 6 bytes
+-04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x000004b9
++# offset 0x000004b9: kitty_image_payload record, payload 27 bytes
++09 00 1b 00 00 00 ac c4 73 9f 00 00 05 00 00 00 # 0x000004b9
++01 00 00 00 08 00 00 00 00 00 00 00 00 ff 00 00 # 0x000004c9
++ff ff 00 00 ff # 0x000004d9
+ 
+-# offset 0x000004c9: finish record, payload 0 bytes
+-06 00 00 00 00 00 3e eb 53 3e # 0x000004c9
++# offset 0x000004de: kitty_image_payload record, payload 27 bytes
++09 00 1b 00 00 00 9b 8c 6f 53 00 00 05 00 00 00 # 0x000004de
++02 00 00 00 08 00 00 00 00 00 00 00 00 00 ff 00 # 0x000004ee
++ff 00 ff 00 ff # 0x000004fe
++
++# offset 0x00000503: kitty_image_payload record, payload 27 bytes
++09 00 1b 00 00 00 fc 9a b7 ae 00 00 05 00 00 00 # 0x00000503
++03 00 00 00 08 00 00 00 00 00 00 00 00 00 00 ff # 0x00000513
++ff 00 00 00 00 # 0x00000523
++
++# offset 0x00000528: history record, payload 6 bytes
++04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x00000528
++
++# offset 0x00000538: finish record, payload 0 bytes
++06 00 00 00 00 00 3e eb 53 3e # 0x00000538
+diff --git a/src/terminal/snapshot/testdata/kitty-history-v1.hex b/src/terminal/snapshot/testdata/kitty-history-v1.hex
+index 210e5a189..e3db54148 100644
+--- a/src/terminal/snapshot/testdata/kitty-history-v1.hex
++++ b/src/terminal/snapshot/testdata/kitty-history-v1.hex
+@@ -95,36 +95,41 @@ ee ee 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000037a
+ # offset 0x00000483: ready record, payload 0 bytes
+ 05 00 00 00 00 00 e4 20 ef 0a # 0x00000483
+ 
+-# offset 0x0000048d: history record, payload 6 bytes
+-04 00 06 00 00 00 20 32 ed e1 00 00 02 00 00 00 # 0x0000048d
++# offset 0x0000048d: kitty_image_payload record, payload 23 bytes
++09 00 17 00 00 00 42 ab c0 48 00 00 04 00 00 00 # 0x0000048d
++01 00 00 00 04 00 00 00 00 00 00 00 00 09 09 09 # 0x0000049d
++ff # 0x000004ad
+ 
+-# offset 0x0000049d: page record, payload 31 bytes
+-03 00 1f 00 00 00 4a ed 2f c2 02 00 02 00 00 00 # 0x0000049d
+-00 00 10 00 c0 00 00 04 00 00 00 08 00 00 00 01 # 0x000004ad
+-00 42 00 00 00 00 00 00 00 # 0x000004bd
++# offset 0x000004ae: history record, payload 6 bytes
++04 00 06 00 00 00 20 32 ed e1 00 00 02 00 00 00 # 0x000004ae
+ 
+-# offset 0x000004c6: kitty_image_page_placements record, payload 56 bytes
+-0a 00 38 00 00 00 2a 3a e3 ea 00 00 01 00 00 00 # 0x000004c6
+-04 00 00 00 01 02 00 00 00 00 00 00 00 00 00 00 # 0x000004d6
+-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000004e6
+-00 00 00 00 00 00 01 00 00 00 01 00 00 00 00 00 # 0x000004f6
+-00 00 # 0x00000506
++# offset 0x000004be: page record, payload 31 bytes
++03 00 1f 00 00 00 4a ed 2f c2 02 00 02 00 00 00 # 0x000004be
++00 00 10 00 c0 00 00 04 00 00 00 08 00 00 00 01 # 0x000004ce
++00 42 00 00 00 00 00 00 00 # 0x000004de
+ 
+-# offset 0x00000508: page record, payload 31 bytes
+-03 00 1f 00 00 00 23 6a 6b 19 02 00 02 00 00 00 # 0x00000508
+-00 00 10 00 c0 00 00 04 00 00 00 08 00 00 00 01 # 0x00000518
+-00 41 00 00 00 00 00 00 00 # 0x00000528
++# offset 0x000004e7: kitty_image_page_placements record, payload 56 bytes
++0a 00 38 00 00 00 2a 3a e3 ea 00 00 01 00 00 00 # 0x000004e7
++04 00 00 00 01 02 00 00 00 00 00 00 00 00 00 00 # 0x000004f7
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x00000507
++00 00 00 00 00 00 01 00 00 00 01 00 00 00 00 00 # 0x00000517
++00 00 # 0x00000527
+ 
+-# offset 0x00000531: kitty_image_page_placements record, payload 119 bytes
+-0a 00 77 00 00 00 83 e0 4b 29 00 00 02 00 00 00 # 0x00000531
+-04 00 00 00 01 01 00 00 00 00 01 00 01 00 00 00 # 0x00000541
+-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x00000551
+-00 00 00 00 00 00 01 00 00 00 01 00 00 00 00 00 # 0x00000561
+-00 00 04 00 00 00 01 09 00 00 00 02 04 00 00 00 # 0x00000571
+-01 01 00 00 00 01 00 00 00 00 00 00 00 00 00 00 # 0x00000581
+-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x00000591
+-00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000005a1
+-00 # 0x000005b1
++# offset 0x00000529: page record, payload 31 bytes
++03 00 1f 00 00 00 23 6a 6b 19 02 00 02 00 00 00 # 0x00000529
++00 00 10 00 c0 00 00 04 00 00 00 08 00 00 00 01 # 0x00000539
++00 41 00 00 00 00 00 00 00 # 0x00000549
+ 
+-# offset 0x000005b2: finish record, payload 0 bytes
+-06 00 00 00 00 00 3e eb 53 3e # 0x000005b2
++# offset 0x00000552: kitty_image_page_placements record, payload 119 bytes
++0a 00 77 00 00 00 83 e0 4b 29 00 00 02 00 00 00 # 0x00000552
++04 00 00 00 01 01 00 00 00 00 01 00 01 00 00 00 # 0x00000562
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x00000572
++00 00 00 00 00 00 01 00 00 00 01 00 00 00 00 00 # 0x00000582
++00 00 04 00 00 00 01 09 00 00 00 02 04 00 00 00 # 0x00000592
++01 01 00 00 00 01 00 00 00 00 00 00 00 00 00 00 # 0x000005a2
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000005b2
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000005c2
++00 # 0x000005d2
++
++# offset 0x000005d3: finish record, payload 0 bytes
++06 00 00 00 00 00 3e eb 53 3e # 0x000005d3
+diff --git a/src/terminal/snapshot/testdata/kitty-incompressible-v1.hex b/src/terminal/snapshot/testdata/kitty-incompressible-v1.hex
+new file mode 100644
+index 000000000..2099b18a5
+--- /dev/null
++++ b/src/terminal/snapshot/testdata/kitty-incompressible-v1.hex
+@@ -0,0 +1,110 @@
++# Ghostty snapshot fixture
++# Kaitai type: ghostty_snapshot
++# Kaitai params:
++# Kaitai offset: 0
++# Wire version: 1
++# Generated by its snapshot test; review before replacing.
++# On mismatch, the candidate is copied to the repository root.
++
++# offset 0x00000000: snapshot envelope
++47 48 4f 53 54 53 4e 50 01 00 # 0x00000000
++
++# offset 0x0000000a: terminal record, payload 912 bytes
++01 00 90 03 00 00 32 1c 82 74 04 00 02 00 28 00 # 0x0000000a
++00 00 28 00 00 00 00 00 01 00 00 00 03 00 00 00 # 0x0000001a
++00 01 00 ff ff ff ff 01 01 01 00 00 00 00 00 08 # 0x0000002a
++00 04 22 00 64 00 00 00 00 04 22 00 64 00 00 00 # 0x0000003a
++00 04 22 00 64 00 00 00 00 00 00 00 00 00 00 00 # 0x0000004a
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000005a
++00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff # 0x0000006a
++ff 00 1d 1f 21 cc 66 66 b5 bd 68 f0 c6 74 81 a2 # 0x0000007a
++be b2 94 bb 8a be b7 c5 c8 c6 66 66 66 d5 4e 53 # 0x0000008a
++b9 ca 4a e7 c5 47 7a a6 da c3 97 d8 70 c0 b1 ea # 0x0000009a
++ea ea 00 00 00 00 00 5f 00 00 87 00 00 af 00 00 # 0x000000aa
++d7 00 00 ff 00 5f 00 00 5f 5f 00 5f 87 00 5f af # 0x000000ba
++00 5f d7 00 5f ff 00 87 00 00 87 5f 00 87 87 00 # 0x000000ca
++87 af 00 87 d7 00 87 ff 00 af 00 00 af 5f 00 af # 0x000000da
++87 00 af af 00 af d7 00 af ff 00 d7 00 00 d7 5f # 0x000000ea
++00 d7 87 00 d7 af 00 d7 d7 00 d7 ff 00 ff 00 00 # 0x000000fa
++ff 5f 00 ff 87 00 ff af 00 ff d7 00 ff ff 5f 00 # 0x0000010a
++00 5f 00 5f 5f 00 87 5f 00 af 5f 00 d7 5f 00 ff # 0x0000011a
++5f 5f 00 5f 5f 5f 5f 5f 87 5f 5f af 5f 5f d7 5f # 0x0000012a
++5f ff 5f 87 00 5f 87 5f 5f 87 87 5f 87 af 5f 87 # 0x0000013a
++d7 5f 87 ff 5f af 00 5f af 5f 5f af 87 5f af af # 0x0000014a
++5f af d7 5f af ff 5f d7 00 5f d7 5f 5f d7 87 5f # 0x0000015a
++d7 af 5f d7 d7 5f d7 ff 5f ff 00 5f ff 5f 5f ff # 0x0000016a
++87 5f ff af 5f ff d7 5f ff ff 87 00 00 87 00 5f # 0x0000017a
++87 00 87 87 00 af 87 00 d7 87 00 ff 87 5f 00 87 # 0x0000018a
++5f 5f 87 5f 87 87 5f af 87 5f d7 87 5f ff 87 87 # 0x0000019a
++00 87 87 5f 87 87 87 87 87 af 87 87 d7 87 87 ff # 0x000001aa
++87 af 00 87 af 5f 87 af 87 87 af af 87 af d7 87 # 0x000001ba
++af ff 87 d7 00 87 d7 5f 87 d7 87 87 d7 af 87 d7 # 0x000001ca
++d7 87 d7 ff 87 ff 00 87 ff 5f 87 ff 87 87 ff af # 0x000001da
++87 ff d7 87 ff ff af 00 00 af 00 5f af 00 87 af # 0x000001ea
++00 af af 00 d7 af 00 ff af 5f 00 af 5f 5f af 5f # 0x000001fa
++87 af 5f af af 5f d7 af 5f ff af 87 00 af 87 5f # 0x0000020a
++af 87 87 af 87 af af 87 d7 af 87 ff af af 00 af # 0x0000021a
++af 5f af af 87 af af af af af d7 af af ff af d7 # 0x0000022a
++00 af d7 5f af d7 87 af d7 af af d7 d7 af d7 ff # 0x0000023a
++af ff 00 af ff 5f af ff 87 af ff af af ff d7 af # 0x0000024a
++ff ff d7 00 00 d7 00 5f d7 00 87 d7 00 af d7 00 # 0x0000025a
++d7 d7 00 ff d7 5f 00 d7 5f 5f d7 5f 87 d7 5f af # 0x0000026a
++d7 5f d7 d7 5f ff d7 87 00 d7 87 5f d7 87 87 d7 # 0x0000027a
++87 af d7 87 d7 d7 87 ff d7 af 00 d7 af 5f d7 af # 0x0000028a
++87 d7 af af d7 af d7 d7 af ff d7 d7 00 d7 d7 5f # 0x0000029a
++d7 d7 87 d7 d7 af d7 d7 d7 d7 d7 ff d7 ff 00 d7 # 0x000002aa
++ff 5f d7 ff 87 d7 ff af d7 ff d7 d7 ff ff ff 00 # 0x000002ba
++00 ff 00 5f ff 00 87 ff 00 af ff 00 d7 ff 00 ff # 0x000002ca
++ff 5f 00 ff 5f 5f ff 5f 87 ff 5f af ff 5f d7 ff # 0x000002da
++5f ff ff 87 00 ff 87 5f ff 87 87 ff 87 af ff 87 # 0x000002ea
++d7 ff 87 ff ff af 00 ff af 5f ff af 87 ff af af # 0x000002fa
++ff af d7 ff af ff ff d7 00 ff d7 5f ff d7 87 ff # 0x0000030a
++d7 af ff d7 d7 ff d7 ff ff ff 00 ff ff 5f ff ff # 0x0000031a
++87 ff ff af ff ff d7 ff ff ff 08 08 08 12 12 12 # 0x0000032a
++1c 1c 1c 26 26 26 30 30 30 3a 3a 3a 44 44 44 4e # 0x0000033a
++4e 4e 58 58 58 62 62 62 6c 6c 6c 76 76 76 80 80 # 0x0000034a
++80 8a 8a 8a 94 94 94 9e 9e 9e a8 a8 a8 b2 b2 b2 # 0x0000035a
++bc bc bc c6 c6 c6 d0 d0 d0 da da da e4 e4 e4 ee # 0x0000036a
++ee ee 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000037a
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000038a
++00 00 00 00 00 00 00 00 00 00 # 0x0000039a
++
++# offset 0x000003a4: screen record, payload 54 bytes
++02 00 36 00 00 00 50 73 c9 4f 00 00 01 00 00 00 # 0x000003a4
++00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 # 0x000003b4
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000003c4
++00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000003d4
++
++# offset 0x000003e4: page record, payload 30 bytes
++03 00 1e 00 00 00 ff 98 bc 3e 04 00 02 00 00 00 # 0x000003e4
++00 00 80 00 c0 00 00 02 00 00 00 08 00 00 00 00 # 0x000003f4
++00 00 00 00 00 00 00 00 # 0x00000404
++
++# offset 0x0000040c: kitty_image_storage record, payload 98 bytes
++08 00 62 00 00 00 04 39 89 90 00 00 ff ff ff 7f # 0x0000040c
++01 00 00 00 01 00 00 00 01 00 00 00 00 07 00 00 # 0x0000041c
++00 00 00 00 00 04 00 00 00 04 00 00 00 01 00 40 # 0x0000042c
++00 00 00 00 00 00 00 00 07 00 00 00 00 00 00 00 # 0x0000043c
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000044c
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000045c
++00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000046c
++
++# offset 0x00000478: continuation record, payload 0 bytes
++07 00 00 00 00 00 27 80 63 d1 # 0x00000478
++
++# offset 0x00000482: ready record, payload 0 bytes
++05 00 00 00 00 00 e4 20 ef 0a # 0x00000482
++
++# offset 0x0000048c: kitty_image_payload record, payload 83 bytes
++09 00 53 00 00 00 0a 7c 7a d7 00 00 07 00 00 00 # 0x0000048c
++01 00 00 00 40 00 00 00 00 00 00 00 00 00 0c ae # 0x0000049c
++24 1b 87 b2 8e 57 f7 60 75 4d c1 d2 fd 33 33 7c # 0x000004ac
++1e df 0b 46 17 0f 31 c6 b0 24 f6 f7 6f f2 b2 15 # 0x000004bc
++a5 3f a0 aa 6e a4 9e db 1f 7c 12 0c 64 d5 e7 41 # 0x000004cc
++67 68 b4 89 46 b7 11 b6 34 34 9c 3c bd # 0x000004dc
++
++# offset 0x000004e9: history record, payload 6 bytes
++04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x000004e9
++
++# offset 0x000004f9: finish record, payload 0 bytes
++06 00 00 00 00 00 3e eb 53 3e # 0x000004f9
+diff --git a/src/terminal/snapshot/testdata/kitty-payload-in-history-v1.hex b/src/terminal/snapshot/testdata/kitty-payload-in-history-v1.hex
+new file mode 100644
+index 000000000..987277802
+--- /dev/null
++++ b/src/terminal/snapshot/testdata/kitty-payload-in-history-v1.hex
+@@ -0,0 +1,135 @@
++# Ghostty snapshot fixture
++# Kaitai type: ghostty_snapshot
++# Kaitai params:
++# Kaitai offset: 0
++# Wire version: 1
++# Generated by its snapshot test; review before replacing.
++# On mismatch, the candidate is copied to the repository root.
++
++# offset 0x00000000: snapshot envelope
++47 48 4f 53 54 53 4e 50 01 00 # 0x00000000
++
++# offset 0x0000000a: terminal record, payload 912 bytes
++01 00 90 03 00 00 11 d6 76 45 02 00 02 00 14 00 # 0x0000000a
++00 00 28 00 00 00 00 00 01 00 00 00 01 00 00 00 # 0x0000001a
++00 01 00 ff ff ff ff 01 01 01 00 00 00 00 00 08 # 0x0000002a
++00 04 22 00 64 00 00 00 00 04 22 00 64 00 00 00 # 0x0000003a
++00 04 22 00 64 00 00 00 00 00 00 00 00 00 00 00 # 0x0000004a
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000005a
++00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff # 0x0000006a
++ff 00 1d 1f 21 cc 66 66 b5 bd 68 f0 c6 74 81 a2 # 0x0000007a
++be b2 94 bb 8a be b7 c5 c8 c6 66 66 66 d5 4e 53 # 0x0000008a
++b9 ca 4a e7 c5 47 7a a6 da c3 97 d8 70 c0 b1 ea # 0x0000009a
++ea ea 00 00 00 00 00 5f 00 00 87 00 00 af 00 00 # 0x000000aa
++d7 00 00 ff 00 5f 00 00 5f 5f 00 5f 87 00 5f af # 0x000000ba
++00 5f d7 00 5f ff 00 87 00 00 87 5f 00 87 87 00 # 0x000000ca
++87 af 00 87 d7 00 87 ff 00 af 00 00 af 5f 00 af # 0x000000da
++87 00 af af 00 af d7 00 af ff 00 d7 00 00 d7 5f # 0x000000ea
++00 d7 87 00 d7 af 00 d7 d7 00 d7 ff 00 ff 00 00 # 0x000000fa
++ff 5f 00 ff 87 00 ff af 00 ff d7 00 ff ff 5f 00 # 0x0000010a
++00 5f 00 5f 5f 00 87 5f 00 af 5f 00 d7 5f 00 ff # 0x0000011a
++5f 5f 00 5f 5f 5f 5f 5f 87 5f 5f af 5f 5f d7 5f # 0x0000012a
++5f ff 5f 87 00 5f 87 5f 5f 87 87 5f 87 af 5f 87 # 0x0000013a
++d7 5f 87 ff 5f af 00 5f af 5f 5f af 87 5f af af # 0x0000014a
++5f af d7 5f af ff 5f d7 00 5f d7 5f 5f d7 87 5f # 0x0000015a
++d7 af 5f d7 d7 5f d7 ff 5f ff 00 5f ff 5f 5f ff # 0x0000016a
++87 5f ff af 5f ff d7 5f ff ff 87 00 00 87 00 5f # 0x0000017a
++87 00 87 87 00 af 87 00 d7 87 00 ff 87 5f 00 87 # 0x0000018a
++5f 5f 87 5f 87 87 5f af 87 5f d7 87 5f ff 87 87 # 0x0000019a
++00 87 87 5f 87 87 87 87 87 af 87 87 d7 87 87 ff # 0x000001aa
++87 af 00 87 af 5f 87 af 87 87 af af 87 af d7 87 # 0x000001ba
++af ff 87 d7 00 87 d7 5f 87 d7 87 87 d7 af 87 d7 # 0x000001ca
++d7 87 d7 ff 87 ff 00 87 ff 5f 87 ff 87 87 ff af # 0x000001da
++87 ff d7 87 ff ff af 00 00 af 00 5f af 00 87 af # 0x000001ea
++00 af af 00 d7 af 00 ff af 5f 00 af 5f 5f af 5f # 0x000001fa
++87 af 5f af af 5f d7 af 5f ff af 87 00 af 87 5f # 0x0000020a
++af 87 87 af 87 af af 87 d7 af 87 ff af af 00 af # 0x0000021a
++af 5f af af 87 af af af af af d7 af af ff af d7 # 0x0000022a
++00 af d7 5f af d7 87 af d7 af af d7 d7 af d7 ff # 0x0000023a
++af ff 00 af ff 5f af ff 87 af ff af af ff d7 af # 0x0000024a
++ff ff d7 00 00 d7 00 5f d7 00 87 d7 00 af d7 00 # 0x0000025a
++d7 d7 00 ff d7 5f 00 d7 5f 5f d7 5f 87 d7 5f af # 0x0000026a
++d7 5f d7 d7 5f ff d7 87 00 d7 87 5f d7 87 87 d7 # 0x0000027a
++87 af d7 87 d7 d7 87 ff d7 af 00 d7 af 5f d7 af # 0x0000028a
++87 d7 af af d7 af d7 d7 af ff d7 d7 00 d7 d7 5f # 0x0000029a
++d7 d7 87 d7 d7 af d7 d7 d7 d7 d7 ff d7 ff 00 d7 # 0x000002aa
++ff 5f d7 ff 87 d7 ff af d7 ff d7 d7 ff ff ff 00 # 0x000002ba
++00 ff 00 5f ff 00 87 ff 00 af ff 00 d7 ff 00 ff # 0x000002ca
++ff 5f 00 ff 5f 5f ff 5f 87 ff 5f af ff 5f d7 ff # 0x000002da
++5f ff ff 87 00 ff 87 5f ff 87 87 ff 87 af ff 87 # 0x000002ea
++d7 ff 87 ff ff af 00 ff af 5f ff af 87 ff af af # 0x000002fa
++ff af d7 ff af ff ff d7 00 ff d7 5f ff d7 87 ff # 0x0000030a
++d7 af ff d7 d7 ff d7 ff ff ff 00 ff ff 5f ff ff # 0x0000031a
++87 ff ff af ff ff d7 ff ff ff 08 08 08 12 12 12 # 0x0000032a
++1c 1c 1c 26 26 26 30 30 30 3a 3a 3a 44 44 44 4e # 0x0000033a
++4e 4e 58 58 58 62 62 62 6c 6c 6c 76 76 76 80 80 # 0x0000034a
++80 8a 8a 8a 94 94 94 9e 9e 9e a8 a8 a8 b2 b2 b2 # 0x0000035a
++bc bc bc c6 c6 c6 d0 d0 d0 da da da e4 e4 e4 ee # 0x0000036a
++ee ee 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000037a
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000038a
++00 00 00 00 00 00 00 00 00 00 # 0x0000039a
++
++# offset 0x000003a4: screen record, payload 54 bytes
++02 00 36 00 00 00 67 31 0e c6 00 00 01 00 04 00 # 0x000003a4
++00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 # 0x000003b4
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000003c4
++00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000003d4
++
++# offset 0x000003e4: page record, payload 31 bytes
++03 00 1f 00 00 00 6d 90 13 8b 02 00 02 00 00 00 # 0x000003e4
++00 00 10 00 c0 00 00 04 00 00 00 08 00 00 00 01 # 0x000003f4
++00 43 00 00 00 00 00 00 00 # 0x00000404
++
++# offset 0x0000040d: kitty_image_storage record, payload 98 bytes
++08 00 62 00 00 00 64 8f 16 1b 00 00 ff ff ff 7f # 0x0000040d
++00 00 00 00 01 00 00 00 01 00 00 00 00 04 00 00 # 0x0000041d
++00 00 00 00 00 01 00 00 00 01 00 00 00 01 00 04 # 0x0000042d
++00 00 00 00 00 00 00 00 04 00 00 00 01 03 00 00 # 0x0000043d
++00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 # 0x0000044d
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000045d
++01 00 00 00 01 00 00 00 00 00 00 00 # 0x0000046d
++
++# offset 0x00000479: continuation record, payload 0 bytes
++07 00 00 00 00 00 27 80 63 d1 # 0x00000479
++
++# offset 0x00000483: ready record, payload 0 bytes
++05 00 00 00 00 00 e4 20 ef 0a # 0x00000483
++
++# offset 0x0000048d: history record, payload 6 bytes
++04 00 06 00 00 00 20 32 ed e1 00 00 02 00 00 00 # 0x0000048d
++
++# offset 0x0000049d: page record, payload 31 bytes
++03 00 1f 00 00 00 4a ed 2f c2 02 00 02 00 00 00 # 0x0000049d
++00 00 10 00 c0 00 00 04 00 00 00 08 00 00 00 01 # 0x000004ad
++00 42 00 00 00 00 00 00 00 # 0x000004bd
++
++# offset 0x000004c6: kitty_image_page_placements record, payload 56 bytes
++0a 00 38 00 00 00 2a 3a e3 ea 00 00 01 00 00 00 # 0x000004c6
++04 00 00 00 01 02 00 00 00 00 00 00 00 00 00 00 # 0x000004d6
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000004e6
++00 00 00 00 00 00 01 00 00 00 01 00 00 00 00 00 # 0x000004f6
++00 00 # 0x00000506
++
++# offset 0x00000508: kitty_image_payload record, payload 23 bytes
++09 00 17 00 00 00 42 ab c0 48 00 00 04 00 00 00 # 0x00000508
++01 00 00 00 04 00 00 00 00 00 00 00 00 09 09 09 # 0x00000518
++ff # 0x00000528
++
++# offset 0x00000529: page record, payload 31 bytes
++03 00 1f 00 00 00 23 6a 6b 19 02 00 02 00 00 00 # 0x00000529
++00 00 10 00 c0 00 00 04 00 00 00 08 00 00 00 01 # 0x00000539
++00 41 00 00 00 00 00 00 00 # 0x00000549
++
++# offset 0x00000552: kitty_image_page_placements record, payload 119 bytes
++0a 00 77 00 00 00 83 e0 4b 29 00 00 02 00 00 00 # 0x00000552
++04 00 00 00 01 01 00 00 00 00 01 00 01 00 00 00 # 0x00000562
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x00000572
++00 00 00 00 00 00 01 00 00 00 01 00 00 00 00 00 # 0x00000582
++00 00 04 00 00 00 01 09 00 00 00 02 04 00 00 00 # 0x00000592
++01 01 00 00 00 01 00 00 00 00 00 00 00 00 00 00 # 0x000005a2
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000005b2
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000005c2
++00 # 0x000005d2
++
++# offset 0x000005d3: finish record, payload 0 bytes
++06 00 00 00 00 00 3e eb 53 3e # 0x000005d3
+diff --git a/src/terminal/snapshot/testdata/kitty-placed-v1.hex b/src/terminal/snapshot/testdata/kitty-placed-v1.hex
+index 66b430a15..dfa3a5d70 100644
+--- a/src/terminal/snapshot/testdata/kitty-placed-v1.hex
++++ b/src/terminal/snapshot/testdata/kitty-placed-v1.hex
+@@ -95,8 +95,13 @@ ee ee 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000037a
+ # offset 0x00000482: ready record, payload 0 bytes
+ 05 00 00 00 00 00 e4 20 ef 0a # 0x00000482
+ 
+-# offset 0x0000048c: history record, payload 6 bytes
+-04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x0000048c
++# offset 0x0000048c: kitty_image_payload record, payload 33 bytes
++09 00 21 00 00 00 f9 53 c5 fe 00 00 01 00 00 00 # 0x0000048c
++01 00 00 00 00 01 00 00 00 00 00 00 01 78 9c fb # 0x0000049c
++cf c0 f0 7f 24 63 00 04 80 7f 81 # 0x000004ac
+ 
+-# offset 0x0000049c: finish record, payload 0 bytes
+-06 00 00 00 00 00 3e eb 53 3e # 0x0000049c
++# offset 0x000004b7: history record, payload 6 bytes
++04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x000004b7
++
++# offset 0x000004c7: finish record, payload 0 bytes
++06 00 00 00 00 00 3e eb 53 3e # 0x000004c7
+diff --git a/src/terminal/snapshot/testdata/kitty-relative-v1.hex b/src/terminal/snapshot/testdata/kitty-relative-v1.hex
+index 04d9c134e..9d055b54b 100644
+--- a/src/terminal/snapshot/testdata/kitty-relative-v1.hex
++++ b/src/terminal/snapshot/testdata/kitty-relative-v1.hex
+@@ -105,8 +105,18 @@ ee ee 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000037a
+ # offset 0x0000051e: ready record, payload 0 bytes
+ 05 00 00 00 00 00 e4 20 ef 0a # 0x0000051e
+ 
+-# offset 0x00000528: history record, payload 6 bytes
+-04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x00000528
++# offset 0x00000528: kitty_image_payload record, payload 23 bytes
++09 00 17 00 00 00 53 8b 6e 85 00 00 01 00 00 00 # 0x00000528
++01 00 00 00 04 00 00 00 00 00 00 00 00 01 02 03 # 0x00000538
++04 # 0x00000548
+ 
+-# offset 0x00000538: finish record, payload 0 bytes
+-06 00 00 00 00 00 3e eb 53 3e # 0x00000538
++# offset 0x00000549: kitty_image_payload record, payload 23 bytes
++09 00 17 00 00 00 64 0d 70 92 00 00 02 00 00 00 # 0x00000549
++01 00 00 00 04 00 00 00 00 00 00 00 00 01 02 03 # 0x00000559
++04 # 0x00000569
++
++# offset 0x0000056a: history record, payload 6 bytes
++04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x0000056a
++
++# offset 0x0000057a: finish record, payload 0 bytes
++06 00 00 00 00 00 3e eb 53 3e # 0x0000057a
+diff --git a/src/terminal/snapshot/testdata/kitty-source-rect-v1.hex b/src/terminal/snapshot/testdata/kitty-source-rect-v1.hex
+index 2a033336f..7023d53d9 100644
+--- a/src/terminal/snapshot/testdata/kitty-source-rect-v1.hex
++++ b/src/terminal/snapshot/testdata/kitty-source-rect-v1.hex
+@@ -95,8 +95,13 @@ ee ee 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000037a
+ # offset 0x00000482: ready record, payload 0 bytes
+ 05 00 00 00 00 00 e4 20 ef 0a # 0x00000482
+ 
+-# offset 0x0000048c: history record, payload 6 bytes
+-04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x0000048c
++# offset 0x0000048c: kitty_image_payload record, payload 31 bytes
++09 00 1f 00 00 00 6c c9 49 9a 00 00 02 00 00 00 # 0x0000048c
++01 00 00 00 40 00 00 00 00 00 00 00 01 78 9c 63 # 0x0000049c
++f8 4f 19 04 00 fc 6d 1f e1 # 0x000004ac
+ 
+-# offset 0x0000049c: finish record, payload 0 bytes
+-06 00 00 00 00 00 3e eb 53 3e # 0x0000049c
++# offset 0x000004b5: history record, payload 6 bytes
++04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x000004b5
++
++# offset 0x000004c5: finish record, payload 0 bytes
++06 00 00 00 00 00 3e eb 53 3e # 0x000004c5
+diff --git a/src/terminal/snapshot/testdata/kitty-virtual-v1.hex b/src/terminal/snapshot/testdata/kitty-virtual-v1.hex
+index acdf5ffd8..c662dee1e 100644
+--- a/src/terminal/snapshot/testdata/kitty-virtual-v1.hex
++++ b/src/terminal/snapshot/testdata/kitty-virtual-v1.hex
+@@ -98,8 +98,13 @@ ee ee 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000037a
+ # offset 0x000004b2: ready record, payload 0 bytes
+ 05 00 00 00 00 00 e4 20 ef 0a # 0x000004b2
+ 
+-# offset 0x000004bc: history record, payload 6 bytes
+-04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x000004bc
++# offset 0x000004bc: kitty_image_payload record, payload 33 bytes
++09 00 21 00 00 00 fe dc d7 66 00 00 03 00 00 00 # 0x000004bc
++01 00 00 00 10 00 00 00 00 00 00 00 01 78 9c 63 # 0x000004cc
++60 f8 ff 1f 19 03 00 3b d4 07 f9 # 0x000004dc
+ 
+-# offset 0x000004cc: finish record, payload 0 bytes
+-06 00 00 00 00 00 3e eb 53 3e # 0x000004cc
++# offset 0x000004e7: history record, payload 6 bytes
++04 00 06 00 00 00 a1 11 8a 5e 00 00 00 00 00 00 # 0x000004e7
++
++# offset 0x000004f7: finish record, payload 0 bytes
++06 00 00 00 00 00 3e eb 53 3e # 0x000004f7
+diff --git a/src/terminal/snapshot/testdata/unknown-records-v1.hex b/src/terminal/snapshot/testdata/unknown-records-v1.hex
+new file mode 100644
+index 000000000..5c5bdc382
+--- /dev/null
++++ b/src/terminal/snapshot/testdata/unknown-records-v1.hex
+@@ -0,0 +1,175 @@
++# Ghostty snapshot fixture
++# Kaitai type: ghostty_snapshot
++# Kaitai params:
++# Kaitai offset: 0
++# Wire version: 1
++# Generated by its snapshot test; review before replacing.
++# On mismatch, the candidate is copied to the repository root.
++
++# offset 0x00000000: snapshot envelope
++47 48 4f 53 54 53 4e 50 01 00 # 0x00000000
++
++# offset 0x0000000a: unknown record 16384, payload 0 bytes
++00 40 00 00 00 00 24 16 7b 60 # 0x0000000a
++
++# offset 0x00000014: terminal record, payload 912 bytes
++01 00 90 03 00 00 11 d6 76 45 02 00 02 00 14 00 # 0x00000014
++00 00 28 00 00 00 00 00 01 00 00 00 01 00 00 00 # 0x00000024
++00 01 00 ff ff ff ff 01 01 01 00 00 00 00 00 08 # 0x00000034
++00 04 22 00 64 00 00 00 00 04 22 00 64 00 00 00 # 0x00000044
++00 04 22 00 64 00 00 00 00 00 00 00 00 00 00 00 # 0x00000054
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x00000064
++00 ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff # 0x00000074
++ff 00 1d 1f 21 cc 66 66 b5 bd 68 f0 c6 74 81 a2 # 0x00000084
++be b2 94 bb 8a be b7 c5 c8 c6 66 66 66 d5 4e 53 # 0x00000094
++b9 ca 4a e7 c5 47 7a a6 da c3 97 d8 70 c0 b1 ea # 0x000000a4
++ea ea 00 00 00 00 00 5f 00 00 87 00 00 af 00 00 # 0x000000b4
++d7 00 00 ff 00 5f 00 00 5f 5f 00 5f 87 00 5f af # 0x000000c4
++00 5f d7 00 5f ff 00 87 00 00 87 5f 00 87 87 00 # 0x000000d4
++87 af 00 87 d7 00 87 ff 00 af 00 00 af 5f 00 af # 0x000000e4
++87 00 af af 00 af d7 00 af ff 00 d7 00 00 d7 5f # 0x000000f4
++00 d7 87 00 d7 af 00 d7 d7 00 d7 ff 00 ff 00 00 # 0x00000104
++ff 5f 00 ff 87 00 ff af 00 ff d7 00 ff ff 5f 00 # 0x00000114
++00 5f 00 5f 5f 00 87 5f 00 af 5f 00 d7 5f 00 ff # 0x00000124
++5f 5f 00 5f 5f 5f 5f 5f 87 5f 5f af 5f 5f d7 5f # 0x00000134
++5f ff 5f 87 00 5f 87 5f 5f 87 87 5f 87 af 5f 87 # 0x00000144
++d7 5f 87 ff 5f af 00 5f af 5f 5f af 87 5f af af # 0x00000154
++5f af d7 5f af ff 5f d7 00 5f d7 5f 5f d7 87 5f # 0x00000164
++d7 af 5f d7 d7 5f d7 ff 5f ff 00 5f ff 5f 5f ff # 0x00000174
++87 5f ff af 5f ff d7 5f ff ff 87 00 00 87 00 5f # 0x00000184
++87 00 87 87 00 af 87 00 d7 87 00 ff 87 5f 00 87 # 0x00000194
++5f 5f 87 5f 87 87 5f af 87 5f d7 87 5f ff 87 87 # 0x000001a4
++00 87 87 5f 87 87 87 87 87 af 87 87 d7 87 87 ff # 0x000001b4
++87 af 00 87 af 5f 87 af 87 87 af af 87 af d7 87 # 0x000001c4
++af ff 87 d7 00 87 d7 5f 87 d7 87 87 d7 af 87 d7 # 0x000001d4
++d7 87 d7 ff 87 ff 00 87 ff 5f 87 ff 87 87 ff af # 0x000001e4
++87 ff d7 87 ff ff af 00 00 af 00 5f af 00 87 af # 0x000001f4
++00 af af 00 d7 af 00 ff af 5f 00 af 5f 5f af 5f # 0x00000204
++87 af 5f af af 5f d7 af 5f ff af 87 00 af 87 5f # 0x00000214
++af 87 87 af 87 af af 87 d7 af 87 ff af af 00 af # 0x00000224
++af 5f af af 87 af af af af af d7 af af ff af d7 # 0x00000234
++00 af d7 5f af d7 87 af d7 af af d7 d7 af d7 ff # 0x00000244
++af ff 00 af ff 5f af ff 87 af ff af af ff d7 af # 0x00000254
++ff ff d7 00 00 d7 00 5f d7 00 87 d7 00 af d7 00 # 0x00000264
++d7 d7 00 ff d7 5f 00 d7 5f 5f d7 5f 87 d7 5f af # 0x00000274
++d7 5f d7 d7 5f ff d7 87 00 d7 87 5f d7 87 87 d7 # 0x00000284
++87 af d7 87 d7 d7 87 ff d7 af 00 d7 af 5f d7 af # 0x00000294
++87 d7 af af d7 af d7 d7 af ff d7 d7 00 d7 d7 5f # 0x000002a4
++d7 d7 87 d7 d7 af d7 d7 d7 d7 d7 ff d7 ff 00 d7 # 0x000002b4
++ff 5f d7 ff 87 d7 ff af d7 ff d7 d7 ff ff ff 00 # 0x000002c4
++00 ff 00 5f ff 00 87 ff 00 af ff 00 d7 ff 00 ff # 0x000002d4
++ff 5f 00 ff 5f 5f ff 5f 87 ff 5f af ff 5f d7 ff # 0x000002e4
++5f ff ff 87 00 ff 87 5f ff 87 87 ff 87 af ff 87 # 0x000002f4
++d7 ff 87 ff ff af 00 ff af 5f ff af 87 ff af af # 0x00000304
++ff af d7 ff af ff ff d7 00 ff d7 5f ff d7 87 ff # 0x00000314
++d7 af ff d7 d7 ff d7 ff ff ff 00 ff ff 5f ff ff # 0x00000324
++87 ff ff af ff ff d7 ff ff ff 08 08 08 12 12 12 # 0x00000334
++1c 1c 1c 26 26 26 30 30 30 3a 3a 3a 44 44 44 4e # 0x00000344
++4e 4e 58 58 58 62 62 62 6c 6c 6c 76 76 76 80 80 # 0x00000354
++80 8a 8a 8a 94 94 94 9e 9e 9e a8 a8 a8 b2 b2 b2 # 0x00000364
++bc bc bc c6 c6 c6 d0 d0 d0 da da da e4 e4 e4 ee # 0x00000374
++ee ee 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x00000384
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x00000394
++00 00 00 00 00 00 00 00 00 00 # 0x000003a4
++
++# offset 0x000003ae: unknown record 16385, payload 1 bytes
++01 40 01 00 00 00 e1 f1 43 17 01 # 0x000003ae
++
++# offset 0x000003b9: screen record, payload 54 bytes
++02 00 36 00 00 00 67 31 0e c6 00 00 01 00 04 00 # 0x000003b9
++00 00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 # 0x000003c9
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000003d9
++00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x000003e9
++
++# offset 0x000003f9: unknown record 16386, payload 2 bytes
++02 40 02 00 00 00 64 af 15 79 02 02 # 0x000003f9
++
++# offset 0x00000405: page record, payload 31 bytes
++03 00 1f 00 00 00 6d 90 13 8b 02 00 02 00 00 00 # 0x00000405
++00 00 10 00 c0 00 00 04 00 00 00 08 00 00 00 01 # 0x00000415
++00 43 00 00 00 00 00 00 00 # 0x00000425
++
++# offset 0x0000042e: unknown record 16387, payload 3 bytes
++03 40 03 00 00 00 fe 41 d6 cd 03 03 03 # 0x0000042e
++
++# offset 0x0000043b: kitty_image_storage record, payload 98 bytes
++08 00 62 00 00 00 64 8f 16 1b 00 00 ff ff ff 7f # 0x0000043b
++00 00 00 00 01 00 00 00 01 00 00 00 00 04 00 00 # 0x0000044b
++00 00 00 00 00 01 00 00 00 01 00 00 00 01 00 04 # 0x0000045b
++00 00 00 00 00 00 00 00 04 00 00 00 01 03 00 00 # 0x0000046b
++00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 # 0x0000047b
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000048b
++01 00 00 00 01 00 00 00 00 00 00 00 # 0x0000049b
++
++# offset 0x000004a7: unknown record 16388, payload 4 bytes
++04 40 04 00 00 00 26 5d 83 5c 04 04 04 04 # 0x000004a7
++
++# offset 0x000004b5: continuation record, payload 0 bytes
++07 00 00 00 00 00 27 80 63 d1 # 0x000004b5
++
++# offset 0x000004bf: unknown record 16389, payload 5 bytes
++05 40 05 00 00 00 b2 43 34 51 05 05 05 05 05 # 0x000004bf
++
++# offset 0x000004ce: ready record, payload 0 bytes
++05 00 00 00 00 00 e4 20 ef 0a # 0x000004ce
++
++# offset 0x000004d8: unknown record 16390, payload 6 bytes
++06 40 06 00 00 00 77 9e 43 ec 06 06 06 06 06 06 # 0x000004d8
++
++# offset 0x000004e8: kitty_image_payload record, payload 23 bytes
++09 00 17 00 00 00 42 ab c0 48 00 00 04 00 00 00 # 0x000004e8
++01 00 00 00 04 00 00 00 00 00 00 00 00 09 09 09 # 0x000004f8
++ff # 0x00000508
++
++# offset 0x00000509: unknown record 16391, payload 7 bytes
++07 40 07 00 00 00 aa 03 2e 50 07 07 07 07 07 07 # 0x00000509
++07 # 0x00000519
++
++# offset 0x0000051a: history record, payload 6 bytes
++04 00 06 00 00 00 20 32 ed e1 00 00 02 00 00 00 # 0x0000051a
++
++# offset 0x0000052a: unknown record 16392, payload 0 bytes
++08 40 00 00 00 00 3b 0e 7d 00 # 0x0000052a
++
++# offset 0x00000534: page record, payload 31 bytes
++03 00 1f 00 00 00 4a ed 2f c2 02 00 02 00 00 00 # 0x00000534
++00 00 10 00 c0 00 00 04 00 00 00 08 00 00 00 01 # 0x00000544
++00 42 00 00 00 00 00 00 00 # 0x00000554
++
++# offset 0x0000055d: unknown record 16393, payload 1 bytes
++09 40 01 00 00 00 7d 54 b7 d3 09 # 0x0000055d
++
++# offset 0x00000568: kitty_image_page_placements record, payload 56 bytes
++0a 00 38 00 00 00 2a 3a e3 ea 00 00 01 00 00 00 # 0x00000568
++04 00 00 00 01 02 00 00 00 00 00 00 00 00 00 00 # 0x00000578
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x00000588
++00 00 00 00 00 00 01 00 00 00 01 00 00 00 00 00 # 0x00000598
++00 00 # 0x000005a8
++
++# offset 0x000005aa: unknown record 16394, payload 2 bytes
++0a 40 02 00 00 00 c9 30 e3 2c 0a 0a # 0x000005aa
++
++# offset 0x000005b6: page record, payload 31 bytes
++03 00 1f 00 00 00 23 6a 6b 19 02 00 02 00 00 00 # 0x000005b6
++00 00 10 00 c0 00 00 04 00 00 00 08 00 00 00 01 # 0x000005c6
++00 41 00 00 00 00 00 00 00 # 0x000005d6
++
++# offset 0x000005df: unknown record 16395, payload 3 bytes
++0b 40 03 00 00 00 db 16 39 5a 0b 0b 0b # 0x000005df
++
++# offset 0x000005ec: kitty_image_page_placements record, payload 119 bytes
++0a 00 77 00 00 00 83 e0 4b 29 00 00 02 00 00 00 # 0x000005ec
++04 00 00 00 01 01 00 00 00 00 01 00 01 00 00 00 # 0x000005fc
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000060c
++00 00 00 00 00 00 01 00 00 00 01 00 00 00 00 00 # 0x0000061c
++00 00 04 00 00 00 01 09 00 00 00 02 04 00 00 00 # 0x0000062c
++01 01 00 00 00 01 00 00 00 00 00 00 00 00 00 00 # 0x0000063c
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000064c
++00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 # 0x0000065c
++00 # 0x0000066c
++
++# offset 0x0000066d: unknown record 16396, payload 4 bytes
++0c 40 04 00 00 00 7c 70 81 c3 0c 0c 0c 0c # 0x0000066d
++
++# offset 0x0000067b: finish record, payload 0 bytes
++06 00 00 00 00 00 3e eb 53 3e # 0x0000067b
+diff --git a/src/terminal/snapshot/verify-kaitai.py b/src/terminal/snapshot/verify-kaitai.py
+index e8c98030c..b92485663 100755
+--- a/src/terminal/snapshot/verify-kaitai.py
++++ b/src/terminal/snapshot/verify-kaitai.py
+@@ -20,8 +20,9 @@ snapshot.ksy as the source of truth and ensures this check cannot accidentally
+ pass against stale generated code. After structural parsing, the script checks
+ what portable Kaitai expressions cannot represent: every record's CRC32C,
+ including records with unknown tags, the order, declared counts and screen
+-keys of the known records, and that Kitty graphics image lengths and pins
+-are consistent with the pages and images they refer to.
++keys of the known records, that Kitty graphics image lengths and pins are
++consistent with the pages and images they refer to, and that every pixel
++payload decodes to exactly the length its image or frame expects.
+ """
+ 
+ from __future__ import annotations
+@@ -34,6 +35,7 @@ import struct
+ import subprocess
+ import sys
+ import tempfile
++import zlib
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any
+@@ -197,10 +199,12 @@ TAG_READY = 5
+ TAG_FINISH = 6
+ TAG_CONTINUATION = 7
+ TAG_KITTY_IMAGE_STORAGE = 8
++TAG_KITTY_IMAGE_PAYLOAD = 9
+ TAG_KITTY_IMAGE_PAGE_PLACEMENTS = 10
+ KNOWN_TAGS = {
+     *range(TAG_TERMINAL, TAG_CONTINUATION + 1),
+     TAG_KITTY_IMAGE_STORAGE,
++    TAG_KITTY_IMAGE_PAYLOAD,
+     TAG_KITTY_IMAGE_PAGE_PLACEMENTS,
+ }
+ KITTY_BPP = {"rgb": 3, "rgba": 4, "gray_alpha": 2, "gray": 1}
+@@ -230,6 +234,10 @@ class Structure:
+     terminal: Any
+     screens: list[Sequence]
+     continuation: Any
++
++    # The KITTY_IMAGE_PAYLOAD records between READY and FINISH, in order.
++    kitty_image_payloads: list[Any]
++
+     histories: list[Sequence]
+ 
+ 
+@@ -249,6 +257,11 @@ class KnownRecords:
+         ]
+         self.index = 0
+ 
++        # Once READY is taken, KITTY_IMAGE_PAYLOAD records may come before any
++        # other record. take collects them here.
++        self.allow_payloads = False
++        self.payloads: list[Any] = []
++
+     def peek(self) -> int | None:
+         """Return the tag of the next known record, or None at the end."""
+         if self.index >= len(self.records):
+@@ -256,7 +269,11 @@ class KnownRecords:
+         return self.records[self.index].header.tag
+ 
+     def take(self, tag: int) -> Any:
+-        """Consume the next known record, which must have this tag."""
++        """Consume the next known record, which must have this tag. After
++        READY, KITTY_IMAGE_PAYLOAD records before it are collected first."""
++        while self.allow_payloads and self.peek() == TAG_KITTY_IMAGE_PAYLOAD:
++            self.payloads.append(self.records[self.index])
++            self.index += 1
+         actual = self.peek()
+         if actual != tag:
+             raise ValueError(f"expected record tag {tag}, found {actual}")
+@@ -265,7 +282,10 @@ class KnownRecords:
+         return record
+ 
+     def take_optional(self, tag: int) -> Any | None:
+-        """Consume the next known record if it has this tag."""
++        """Consume the next known record if it has this tag. A
++        KITTY_IMAGE_PAYLOAD in between means the record is absent, which is
++        how a payload between a PAGE and its KITTY_IMAGE_PAGE_PLACEMENTS is
++        caught."""
+         return self.take(tag) if self.peek() == tag else None
+ 
+     def take_sequence(self, tag: int, page_count: Any) -> Sequence:
+@@ -305,6 +325,8 @@ def snapshot_structure(snapshot: Any) -> Structure:
+     ]
+     continuation = records.take(TAG_CONTINUATION)
+     records.take(TAG_READY)
++    records.allow_payloads = True
++
+     histories = [
+         records.take_sequence(
+             TAG_HISTORY,
+@@ -320,6 +342,7 @@ def snapshot_structure(snapshot: Any) -> Structure:
+         terminal=terminal,
+         screens=screens,
+         continuation=continuation,
++        kitty_image_payloads=records.payloads,
+         histories=histories,
+     )
+ 
+@@ -331,16 +354,52 @@ def validate_kitty_pin(pin: Any, page: Any, label: str) -> None:
+         raise ValueError(f"{label}: pin outside its page")
+ 
+ 
++def validate_kitty_image_payload(
++    payload: Any,
++    images_by_key: dict[Any, dict[int, Any]],
++) -> None:
++    """Require a KITTY_IMAGE_PAYLOAD to name a declared screen and an image or
++    frame on it, and to decode to exactly that length."""
++    images = images_by_key.get(payload.key)
++    if images is None:
++        raise ValueError(
++            f"KITTY_IMAGE_PAYLOAD names undeclared screen {payload.key}"
++        )
++    image = images.get(payload.image_id)
++    if image is None:
++        raise ValueError(f"payload for unknown image {payload.image_id}")
++    if payload.frame == 1:
++        expected = image.data_length
++    else:
++        animation = getattr(image, "animation", None)
++        frames = animation.frames if animation is not None else []
++        if payload.frame - 2 >= len(frames):
++            raise ValueError("payload for a missing animation frame")
++        expected = frames[payload.frame - 2].data_length
++    if payload.decoded_length != expected:
++        raise ValueError("payload decoded_length mismatch")
++    data = payload.data
++    if payload.compression.name == "zlib":
++        data = zlib.decompress(data)
++    if len(data) != payload.decoded_length:
++        raise ValueError("payload does not decode to decoded_length")
++
++
+ def validate_kitty(structure: Structure) -> None:
+     """Validate the Kitty graphics records: screen keys, image and frame
+-    lengths, and that every pin names a cell of its page."""
++    lengths, that every pin names a cell of its page, and that every pixel
++    payload belongs to an image and decodes to its expected length."""
++    images_by_key: dict[Any, dict[int, Any]] = {}
+     for screen in structure.screens:
++        key = screen.record.payload.header.key
++        images_by_key[key] = {}
+         storage = screen.kitty_image_storage
+         if storage is None:
+             continue
+         payload = storage.payload
+-        if payload.key != screen.record.payload.header.key:
++        if payload.key != key:
+             raise ValueError("KITTY_IMAGE_STORAGE key differs from its SCREEN")
++        images_by_key[key] = {image.id: image for image in payload.images}
+ 
+         for image in payload.images:
+             if image.format.name not in KITTY_BPP:
+@@ -371,6 +430,9 @@ def validate_kitty(structure: Structure) -> None:
+                 "KITTY_IMAGE_STORAGE",
+             )
+ 
++    for record in structure.kitty_image_payloads:
++        validate_kitty_image_payload(record.payload, images_by_key)
++
+     for sequence in structure.histories:
+         key = sequence.record.payload.key
+         for page, placements in zip(sequence.pages, sequence.page_placements):
+-- 
+2.56.0
+

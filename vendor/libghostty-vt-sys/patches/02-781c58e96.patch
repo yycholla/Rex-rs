@@ -1,0 +1,862 @@
+From 781c58e9665ae6409f98d29fe8372e9cad7fd078 Mon Sep 17 00:00:00 2001
+From: Mitchell Hashimoto <m@mitchellh.com>
+Date: Tue, 20 Oct 2026 20:28:20 -0700
+Subject: [PATCH] terminal: skip snapshot records with unknown tags
+
+---
+ include/ghostty/vt/snapshot.h          |   6 +
+ src/benchmark/TerminalSnapshot.zig     |  45 ++++--
+ src/terminal/snapshot/fixture.zig      |   7 +-
+ src/terminal/snapshot/main.zig         |   7 +
+ src/terminal/snapshot/record.zig       | 215 +++++++++++++++++++++++--
+ src/terminal/snapshot/snapshot.ksy     |  84 +++++-----
+ src/terminal/snapshot/snapshot.zig     |  75 +++++++++
+ src/terminal/snapshot/verify-kaitai.py | 147 +++++++++++++----
+ 8 files changed, 482 insertions(+), 104 deletions(-)
+
+diff --git a/include/ghostty/vt/snapshot.h b/include/ghostty/vt/snapshot.h
+index feaa36762..cc9eb63eb 100644
+--- a/include/ghostty/vt/snapshot.h
++++ b/include/ghostty/vt/snapshot.h
+@@ -109,6 +109,12 @@ extern "C" {
+  * CRC32C, like every other record. Declared record counts, tags, and strict
+  * decoding enforce the stream's ordering and completeness.
+  *
++ * A decoder skips any record whose tag it does not know, wherever it
++ * appears. This lets a newer library add optional kinds of records that
++ * older libraries ignore, without changing the snapshot version. Skipped
++ * records are still checked, so a damaged record fails decoding even when
++ * its tag is unknown.
++ *
+  * Snapshot format version 1 is a work in progress and does not yet carry a
+  * binary-compatibility guarantee.
+  *
+diff --git a/src/benchmark/TerminalSnapshot.zig b/src/benchmark/TerminalSnapshot.zig
+index aea5e1f96..ab8ab6561 100644
+--- a/src/benchmark/TerminalSnapshot.zig
++++ b/src/benchmark/TerminalSnapshot.zig
+@@ -267,14 +267,11 @@ fn stepReport(ptr: *anyopaque) Benchmark.Error!void {
+     const self: *TerminalSnapshot = @ptrCast(@alignCast(ptr));
+     const bytes = self.encoded.written();
+ 
+-    var payload_totals = std.enums.EnumArray(
+-        snapshot.record.Tag,
+-        u64,
+-    ).initFill(0);
+-    var record_counts = std.enums.EnumArray(
+-        snapshot.record.Tag,
+-        u64,
+-    ).initFill(0);
++    // A record tag can hold values that `Tag` does not name, so totals are
++    // kept per named tag rather than in an EnumArray over every value.
++    const tags = comptime std.enums.values(snapshot.record.Tag);
++    var payload_totals: [tags.len]u64 = @splat(0);
++    var record_counts: [tags.len]u64 = @splat(0);
+     var record_total: u64 = 0;
+ 
+     var offset: usize = snapshot.envelope.encoded_len;
+@@ -285,22 +282,25 @@ fn stepReport(ptr: *anyopaque) Benchmark.Error!void {
+             bytes[offset + 2 ..][0..4],
+             .little,
+         );
+-        const tag = std.enums.fromInt(snapshot.record.Tag, tag_raw) orelse {
++        const index = std.mem.indexOfScalar(
++            snapshot.record.Tag,
++            tags,
++            @fromBackingInt(tag_raw),
++        ) orelse {
+             log.warn("unknown record tag {}", .{tag_raw});
+             return error.BenchmarkFailed;
+         };
+-        payload_totals.getPtr(tag).* += payload_len;
+-        record_counts.getPtr(tag).* += 1;
++        payload_totals[index] += payload_len;
++        record_counts[index] += 1;
+         record_total += 1;
+         offset += snapshot.record.Header.len + payload_len;
+     }
+ 
+-    var it = payload_totals.iterator();
+-    while (it.next()) |entry| {
++    for (tags, payload_totals, record_counts) |tag, payload, records| {
+         std.debug.print("terminal-snapshot tag={s} records={d} payload={d}\n", .{
+-            @tagName(entry.key),
+-            record_counts.get(entry.key),
+-            entry.value.*,
++            @tagName(tag),
++            records,
++            payload,
+         });
+     }
+     std.debug.print(
+@@ -336,6 +336,19 @@ test "TerminalSnapshot decode round trip" {
+     _ = try bench.run(.once);
+ }
+ 
++test "TerminalSnapshot report" {
++    const testing = std.testing;
++    const impl: *TerminalSnapshot = try .create(testing.allocator, .{
++        .mode = .report,
++        .@"terminal-rows" = 4,
++        .@"terminal-cols" = 8,
++    });
++    defer impl.destroy(testing.allocator);
++
++    const bench = impl.benchmark();
++    _ = try bench.run(.once);
++}
++
+ test "TerminalSnapshot decode READY prefix" {
+     const testing = std.testing;
+     const impl: *TerminalSnapshot = try .create(testing.allocator, .{
+diff --git a/src/terminal/snapshot/fixture.zig b/src/terminal/snapshot/fixture.zig
+index df6f97ef4..8fb75191b 100644
+--- a/src/terminal/snapshot/fixture.zig
++++ b/src/terminal/snapshot/fixture.zig
+@@ -425,10 +425,13 @@ fn formatSnapshot(
+ 
+         // Known tags make the annotated diff readable. Preserve unknown tags
+         // numerically so formatter output is still useful for encoder bugs.
+-        if (std.enums.fromInt(record.Tag, tag_raw)) |tag| {
++        if (std.enums.tagName(
++            record.Tag,
++            @fromBackingInt(@intCast(tag_raw)),
++        )) |name| {
+             try writer.print(
+                 "\n# offset 0x{x:0>8}: {s} record, payload {} bytes\n",
+-                .{ offset, @tagName(tag), payload_len },
++                .{ offset, name, payload_len },
+             );
+         } else {
+             try writer.print(
+diff --git a/src/terminal/snapshot/main.zig b/src/terminal/snapshot/main.zig
+index cf780b9e4..3cb486308 100644
+--- a/src/terminal/snapshot/main.zig
++++ b/src/terminal/snapshot/main.zig
+@@ -62,6 +62,13 @@
+ //! +----------------------------------------+
+ //! ```
+ //!
++//! A decoder skips any record whose tag it does not know, wherever it
++//! appears, after checking its length and CRC32C. This lets newer encoders
++//! add optional kinds of records that older decoders ignore, without
++//! changing the snapshot version. The version only changes when the layout
++//! of an existing record changes, or when a new kind of record is needed for
++//! the terminal to be correct. See "Unknown Records" in `record.zig`.
++//!
+ //! The SCREEN and HISTORY sequence groups may each appear in any key order.
+ //! Each key must occur exactly once in each group and must identify one of the
+ //! screens declared by TERMINAL. SCREEN contains the complete pages needed to
+diff --git a/src/terminal/snapshot/record.zig b/src/terminal/snapshot/record.zig
+index 7fdde227a..fd83e2287 100644
+--- a/src/terminal/snapshot/record.zig
++++ b/src/terminal/snapshot/record.zig
+@@ -16,7 +16,35 @@
+ //! |      6 |             4 | CRC32C (`u32`)         |
+ //! |     10 | `payload_len` | Payload                |
+ //!
+-//! Supported tags are in `Tag`.
++//! The tags this build understands are listed in `Tag`.
++//!
++//! ## Unknown Records
++//!
++//! A decoder skips any record whose tag it does not know, wherever that
++//! record appears, and continues with the next record. Skipping still reads
++//! the whole record and checks its CRC32C, so a damaged record fails
++//! decoding even when its tag is unknown.
++//!
++//! For example, a decoder sees this sequence as two PAGE records in a row:
++//!
++//! ```text
++//! PAGE | tag 0x4000 (unknown, skipped) | PAGE
++//! ```
++//!
++//! Records with known tags are checked as carefully as ever. Their payloads
++//! must be read exactly to the end, and the order and counts that other
++//! records declare for them must match.
++//!
++//! This is how the format grows without changing its version. A newer
++//! encoder can add new kinds of records, and older decoders skip them. That
++//! only works if every new kind of record is optional, meaning the terminal
++//! is still correct when a decoder skips it. Anything the terminal cannot be
++//! correct without, and any change to the layout of an existing record,
++//! needs a new snapshot version instead.
++//!
++//! You rarely need to think about this when writing a record decoder.
++//! `Reader.init` reads headers with `nextHeader`, which does the skipping,
++//! so every decoder built on `Reader` skips unknown records automatically.
+ 
+ const std = @import("std");
+ const assert = std.debug.assert;
+@@ -30,7 +58,14 @@ const io = @import("io.zig");
+ pub const Crc32c = @import("../../crc32c.zig").Crc32c;
+ 
+ /// Identifies the layout and meaning of a record payload.
+-/// The current snapshot version rejects every value not listed here.
++///
++/// A `Tag` can hold any 16-bit value, not just the ones named here, because
++/// a snapshot may come from a newer encoder with tags this build has never
++/// heard of. Use `known` to tell the two apart. Decoders skip records whose
++/// tag is not known (see "Unknown Records" above).
++///
++/// Any tag added from now on must describe an optional record, one that a
++/// decoder can skip without making the terminal incorrect.
+ pub const Tag = enum(u16) {
+     /// Terminal-wide live state and configuration.
+     terminal = 1,
+@@ -52,6 +87,33 @@ pub const Tag = enum(u16) {
+ 
+     /// Canonical unfinished standard TerminalStream input.
+     continuation = 7,
++
++    _,
++
++    /// Returns true if this build decodes records with this tag, and false
++    /// for a tag it should skip.
++    ///
++    /// ```zig
++    /// const page: Tag = .page;
++    /// page.known(); // true
++    ///
++    /// const future: Tag = @fromBackingInt(0x4000);
++    /// future.known(); // false
++    /// ```
++    pub fn known(self: Tag) bool {
++        return switch (self) {
++            .terminal,
++            .screen,
++            .page,
++            .history,
++            .ready,
++            .finish,
++            .continuation,
++            => true,
++
++            _ => false,
++        };
++    }
+ };
+ 
+ /// The fixed framing that precedes every record payload.
+@@ -76,7 +138,7 @@ pub const Header = struct {
+     crc32c: u32,
+ 
+     /// Errors possible while decoding a record header.
+-    pub const DecodeError = std.Io.Reader.Error || error{InvalidTag};
++    pub const DecodeError = std.Io.Reader.Error;
+ 
+     /// Encode the fixed record header.
+     pub fn encode(
+@@ -87,16 +149,14 @@ pub const Header = struct {
+         try io.writeInt(writer, u32, self.crc32c);
+     }
+ 
+-    /// Decode a fixed record header and reject unknown tags.
+-    /// Payload length and CRC validation occur while decoding the payload.
++    /// Decode one fixed record header, whatever its tag. The payload length
++    /// and CRC are checked later, while the payload is read.
++    ///
++    /// Most callers want `nextHeader` instead, which skips records with
++    /// unknown tags and returns the first header this build understands.
+     pub fn decode(reader: *std.Io.Reader) DecodeError!Header {
+-        const tag_raw = try io.readInt(reader, u16);
+-        const tag = std.enums.fromInt(Tag, tag_raw) orelse {
+-            return error.InvalidTag;
+-        };
+-
+         return .{
+-            .tag = tag,
++            .tag = @fromBackingInt(@intCast(try io.readInt(reader, u16))),
+             .payload_len = try io.readInt(reader, u32),
+             .crc32c = try io.readInt(reader, u32),
+         };
+@@ -118,6 +178,47 @@ pub const Header = struct {
+     }
+ };
+ 
++/// Errors possible from `nextHeader`. Besides read errors, a skipped
++/// record can fail its checks: `error.InvalidChecksum` for a damaged
++/// record, or `error.PayloadNotExhausted` if its payload cannot be read to
++/// the declared length.
++pub const NextHeaderError = Header.DecodeError || Reader.FinishError;
++
++/// Read the next record header whose tag this build knows, skipping any
++/// records with unknown tags on the way.
++///
++/// Each skipped record is read to its end and its CRC32C is checked, so a
++/// damaged record fails here even though its contents are ignored. On
++/// return, `source` is positioned at the start of the returned header's
++/// payload. See "Unknown Records" above.
++///
++/// Most record decoders call `Reader.init`, which uses this. Call it
++/// directly when you need to see the tag before choosing how to decode the
++/// record, then hand the header to `Reader.initHeader`:
++///
++/// ```zig
++/// const header = try record.nextHeader(source);
++/// switch (header.tag) {
++///     .page => {
++///         var reader: record.Reader = undefined;
++///         reader.initHeader(source, header);
++///         // ... decode the PAGE payload, then reader.finish() ...
++///     },
++///     else => return error.UnexpectedRecordTag,
++/// }
++/// ```
++pub fn nextHeader(source: *std.Io.Reader) NextHeaderError!Header {
++    while (true) {
++        const header = try Header.decode(source);
++        if (header.tag.known()) return header;
++
++        var skipped: Reader = undefined;
++        skipped.initHeader(source, header);
++        try skipped.payloadReader().discardAll(header.payload_len);
++        try skipped.finish();
++    }
++}
++
+ /// A writer that calculates a record checksum without retaining payload bytes.
+ /// The checksum is initialized with the encoded tag and payload length.
+ pub const Checksum = struct {
+@@ -269,7 +370,9 @@ pub const Reader = struct {
+         payload: std.Io.Reader,
+     };
+ 
+-    pub const InitError = Header.DecodeError;
++    /// Errors possible from `init`, which reads the header with
++    /// `nextHeader`.
++    pub const InitError = NextHeaderError;
+ 
+     /// Errors detected after a payload decoder returns.
+     pub const FinishError = error{
+@@ -280,7 +383,9 @@ pub const Reader = struct {
+         PayloadNotExhausted,
+     };
+ 
+-    /// Decode a record header and initialize its payload reader.
++    /// Read the next record header with a known tag and get ready to read
++    /// its payload. Records with unknown tags before it are skipped, as
++    /// described in `nextHeader`.
+     ///
+     /// `self` must remain at a stable address until `finish` returns. Decode
+     /// the payload only through the reader returned by `payloadReader`.
+@@ -288,8 +393,24 @@ pub const Reader = struct {
+         self: *Reader,
+         source: *std.Io.Reader,
+     ) InitError!void {
++        self.initHeader(source, try nextHeader(source));
++    }
++
++    /// Get ready to read the payload of a header that was already read
++    /// from `source`, usually with `nextHeader`. `source` must be
++    /// positioned at the start of that payload.
++    ///
++    /// Use this when you need to look at the tag before deciding how to
++    /// decode the record. Otherwise use `init`. The same rules apply
++    /// afterward: read the payload through `payloadReader`, then call
++    /// `finish`.
++    pub fn initHeader(
++        self: *Reader,
++        source: *std.Io.Reader,
++        header: Header,
++    ) void {
+         self.* = undefined;
+-        self.header = try Header.decode(source);
++        self.header = header;
+ 
+         // The complete payload is already sitting in the source buffer:
+         // borrow it in place. Payload decoders read from a fixed reader
+@@ -409,15 +530,75 @@ test "golden PAGE record header and checksum" {
+     try std.testing.expectEqual(header, try Header.decode(&reader));
+ }
+ 
+-test "reject invalid tags" {
+-    for ([_]u16{ 0, 8, std.math.maxInt(u16) }) |tag| {
++test "headers decode unknown tags" {
++    for ([_]u16{ 0, 12, std.math.maxInt(u16) }) |tag| {
+         var fixture: [Header.len]u8 = @splat(0);
+         std.mem.writeInt(u16, fixture[0..2], tag, .little);
+         var reader: std.Io.Reader = .fixed(&fixture);
+-        try std.testing.expectError(error.InvalidTag, Header.decode(&reader));
++        const header = try Header.decode(&reader);
++        try std.testing.expectEqual(tag, @backingInt(header.tag));
++        try std.testing.expect(!header.tag.known());
++    }
++}
++
++/// Test helper that appends one complete record with any raw tag,
++/// including tags that `Tag` does not name.
++pub fn testWriteRaw(
++    writer: *std.Io.Writer,
++    tag: u16,
++    payload: []const u8,
++) !void {
++    const len: u32 = @intCast(payload.len);
++    var checksum: Checksum = .init(@fromBackingInt(@intCast(tag)), len);
++    try checksum.writer().writeAll(payload);
++    try (Header{
++        .tag = @fromBackingInt(@intCast(tag)),
++        .payload_len = len,
++        .crc32c = checksum.final(),
++    }).encode(writer);
++    try writer.writeAll(payload);
++}
++
++test "record reader skips unknown records" {
++    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
++    defer encoded.deinit();
++    try testWriteRaw(&encoded.writer, 0, "");
++    try testWriteRaw(&encoded.writer, 0x7fff, "unknown payload");
++    try testWriteRaw(&encoded.writer, @backingInt(Tag.page), "page");
++
++    // Skip both from a fully buffered source and through a one-byte buffer,
++    // which forces the streaming payload path.
++    for (0..2) |streaming| {
++        var fixed: std.Io.Reader = .fixed(encoded.written());
++        var buf: [1]u8 = undefined;
++        var limited = fixed.limited(.unlimited, &buf);
++        const source = if (streaming == 1) &limited.interface else &fixed;
++
++        var record_reader: Reader = undefined;
++        try record_reader.init(source);
++        try std.testing.expectEqual(Tag.page, record_reader.header.tag);
++        var payload: [4]u8 = undefined;
++        try record_reader.payloadReader().readSliceAll(&payload);
++        try record_reader.finish();
++        try std.testing.expectEqualStrings("page", &payload);
+     }
+ }
+ 
++test "record reader rejects a corrupted unknown record" {
++    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
++    defer encoded.deinit();
++    try testWriteRaw(&encoded.writer, 0x7fff, "unknown payload");
++    try testWriteRaw(&encoded.writer, @backingInt(Tag.page), "page");
++    encoded.written()[Header.len] ^= 1;
++
++    var source: std.Io.Reader = .fixed(encoded.written());
++    var record_reader: Reader = undefined;
++    try std.testing.expectError(
++        error.InvalidChecksum,
++        record_reader.init(&source),
++    );
++}
++
+ test "reject every header truncation" {
+     for (0..Header.len) |len| {
+         var reader: std.Io.Reader = .fixed(
+diff --git a/src/terminal/snapshot/snapshot.ksy b/src/terminal/snapshot/snapshot.ksy
+index 2da917ea3..412391aa4 100644
+--- a/src/terminal/snapshot/snapshot.ksy
++++ b/src/terminal/snapshot/snapshot.ksy
+@@ -15,28 +15,23 @@ doc: |
+   this schema. Each SCREEN declares its complete logical history extent before
+   READY.
+ 
+-  Record CRC32C values are represented here but cannot be calculated by
+-  portable Kaitai Struct expressions. The adjacent verify-kaitai.py script
+-  validates those values after parsing.
++  A decoder skips every record whose tag it does not know, wherever it
++  appears, after checking its length and CRC32C. This lets newer encoders
++  add optional kinds of records without changing the format version.
++
++  Because unknown records can appear between any two records, this schema
++  parses a snapshot as a flat list of records ending at FINISH. Each record
++  with a known tag gets its typed payload, and any other record keeps its
++  payload as raw bytes. The adjacent verify-kaitai.py script checks what
++  portable Kaitai expressions cannot: the order of the records, the
++  declared counts, the screen keys, and every record's CRC32C.
+ seq:
+   - id: envelope
+     type: envelope
+-  - id: terminal
+-    type: terminal_record
+-  - id: screens
+-    type: screen_sequence
+-    repeat: expr
+-    repeat-expr: terminal.payload.header.screen_count
+-  - id: continuation
+-    type: continuation_record
+-  - id: ready
+-    type: checkpoint_record(5)
+-  - id: histories
+-    type: history_sequence
+-    repeat: expr
+-    repeat-expr: terminal.payload.header.screen_count
+-  - id: finish
+-    type: checkpoint_record(6)
++  - id: records
++    type: record
++    repeat: until
++    repeat-until: _.header.tag == 6
+ enums:
+   record_tag:
+     1: terminal
+@@ -174,6 +169,37 @@ types:
+       - id: crc32c
+         type: u4
+ 
++  record:
++    doc: |
++      Any record. The payload type follows the tag. READY, FINISH and
++      CONTINUATION payloads are raw bytes, and so is the payload of any
++      record with an unknown tag. Decoders skip those unknown records.
++    seq:
++      - id: header
++        type: record_header_any
++      - id: payload
++        size: header.payload_length
++        type:
++          switch-on: header.tag
++          cases:
++            1: terminal_payload
++            2: screen_payload
++            3: page_payload
++            4: history_payload
++
++  record_header_any:
++    doc: |
++      The same framing as record_header, but accepting any tag, including
++      unknown ones. record_header requires one expected tag and is used to
++      parse a single record of a known kind.
++    seq:
++      - id: tag
++        type: u2
++      - id: payload_length
++        type: u4
++      - id: crc32c
++        type: u4
++
+   terminal_record:
+     seq:
+       - id: header
+@@ -229,26 +255,6 @@ types:
+         valid:
+           expr: _.size == 0
+ 
+-  screen_sequence:
+-    doc: SCREEN followed by its declared PAGE records, oldest-to-newest.
+-    seq:
+-      - id: screen
+-        type: screen_record
+-      - id: pages
+-        type: page_record
+-        repeat: expr
+-        repeat-expr: screen.payload.header.page_count
+-
+-  history_sequence:
+-    doc: HISTORY followed by its declared PAGE records, newest-to-oldest.
+-    seq:
+-      - id: history
+-        type: history_record
+-      - id: pages
+-        type: page_record
+-        repeat: expr
+-        repeat-expr: history.payload.page_count
+-
+   terminal_payload:
+     seq:
+       - id: header
+diff --git a/src/terminal/snapshot/snapshot.zig b/src/terminal/snapshot/snapshot.zig
+index 0efb8663b..70de2908f 100644
+--- a/src/terminal/snapshot/snapshot.zig
++++ b/src/terminal/snapshot/snapshot.zig
+@@ -1572,6 +1572,81 @@ test "complete snapshot rejects ordering and invalid markers" {
+     );
+ }
+ 
++test "complete snapshot skips unknown records in every position" {
++    const testing = std.testing;
++
++    // Put an unknown record before every record of the complete golden,
++    // including before FINISH, so one sits between every pair of records.
++    // The tags vary, and so do the payload lengths, including empty.
++    var with_unknown: std.Io.Writer.Allocating = .init(testing.allocator);
++    defer with_unknown.deinit();
++    var unknown_offsets: std.ArrayList(usize) = .empty;
++    defer unknown_offsets.deinit(testing.allocator);
++    {
++        const bytes: []const u8 = &test_complete_fixture;
++        try with_unknown.writer.writeAll(bytes[0..envelope.encoded_len]);
++        var offset: usize = envelope.encoded_len;
++        var i: usize = 0;
++        while (offset < bytes.len) : (i += 1) {
++            const len = std.mem.readInt(u32, bytes[offset + 2 ..][0..4], .little);
++            const end = offset + record.Header.len + len;
++            try unknown_offsets.append(testing.allocator, with_unknown.written().len);
++            const payload: [8]u8 = @splat(@intCast(i));
++            try record.testWriteRaw(
++                &with_unknown.writer,
++                @intCast(0x4000 + i),
++                payload[0 .. i % payload.len],
++            );
++            try with_unknown.writer.writeAll(bytes[offset..end]);
++            offset = end;
++        }
++    }
++
++    // Both decoders restore exactly the terminal of the golden.
++    {
++        var source: std.Io.Reader = .fixed(with_unknown.written());
++        var decoded = try decodeExact(
++            testing.allocator,
++            testing.io,
++            &source,
++            test_decode_options,
++        );
++        defer decoded.deinit(testing.allocator);
++        var reencoded: std.Io.Writer.Allocating = .init(testing.allocator);
++        defer reencoded.deinit();
++        try encode(testing.allocator, &reencoded.writer, &decoded.terminal.?, test_encode_options);
++        try testing.expectEqualSlices(u8, &test_complete_fixture, reencoded.written());
++    }
++    {
++        var source: std.Io.Reader = .fixed(with_unknown.written());
++        var buf: [1]u8 = undefined;
++        var limited = source.limited(.unlimited, &buf);
++        var decoder: Decoder = .init(&limited.interface);
++        var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
++        defer decoded.deinit(testing.allocator);
++        const restored = &decoded.terminal.?;
++        while (try decoder.next(testing.allocator, restored)) |_| {}
++        var reencoded: std.Io.Writer.Allocating = .init(testing.allocator);
++        defer reencoded.deinit();
++        try encode(testing.allocator, &reencoded.writer, restored, test_encode_options);
++        try testing.expectEqualSlices(u8, &test_complete_fixture, reencoded.written());
++    }
++
++    // A corrupted unknown record still fails its CRC, wherever it is. The
++    // first payload byte is corrupted, or the tag when the payload is empty.
++    for (unknown_offsets.items) |offset| {
++        const corrupted = try testing.allocator.dupe(u8, with_unknown.written());
++        defer testing.allocator.free(corrupted);
++        const len = std.mem.readInt(u32, corrupted[offset + 2 ..][0..4], .little);
++        corrupted[if (len > 0) offset + record.Header.len else offset] ^= 0x01;
++        var source: std.Io.Reader = .fixed(corrupted);
++        try testing.expectError(
++            error.InvalidChecksum,
++            decode(testing.allocator, testing.io, &source, test_decode_options),
++        );
++    }
++}
++
+ test "complete snapshot leaves continuation bytes unread" {
+     const testing = std.testing;
+ 
+diff --git a/src/terminal/snapshot/verify-kaitai.py b/src/terminal/snapshot/verify-kaitai.py
+index 65df64c93..0be63e1f9 100755
+--- a/src/terminal/snapshot/verify-kaitai.py
++++ b/src/terminal/snapshot/verify-kaitai.py
+@@ -18,8 +18,9 @@ https://ide.kaitai.io/.
+ The generated Python parser exists only in a temporary directory. This keeps
+ snapshot.ksy as the source of truth and ensures this check cannot accidentally
+ pass against stale generated code. After structural parsing, the script checks
+-record CRC32C values and cross-record invariants that portable Kaitai
+-expressions cannot represent.
++what portable Kaitai expressions cannot represent: every record's CRC32C,
++including records with unknown tags, and the order, declared counts and screen
++keys of the known records.
+ """
+ 
+ from __future__ import annotations
+@@ -187,28 +188,115 @@ def validate_record(record: Any, data: bytes, offset: int) -> int:
+     return offset + RECORD_HEADER_SIZE + len(payload)
+ 
+ 
+-def all_snapshot_records(snapshot: Any) -> list[Any]:
+-    """Return complete-snapshot records in wire order."""
+-    records = [snapshot.terminal]
+-    for sequence in snapshot.screens:
+-        records.append(sequence.screen)
+-        records.extend(sequence.pages)
+-    records.append(snapshot.continuation)
+-    records.append(snapshot.ready)
+-    for sequence in snapshot.histories:
+-        records.append(sequence.history)
+-        records.extend(sequence.pages)
+-    records.append(snapshot.finish)
+-    return records
++TAG_TERMINAL = 1
++TAG_SCREEN = 2
++TAG_PAGE = 3
++TAG_HISTORY = 4
++TAG_READY = 5
++TAG_FINISH = 6
++TAG_CONTINUATION = 7
++KNOWN_TAGS = set(range(TAG_TERMINAL, TAG_CONTINUATION + 1))
++
++
++@dataclass
++class Sequence:
++    """A SCREEN or HISTORY record and its PAGE records."""
++
++    record: Any
++    pages: list[Any]
++
++
++@dataclass
++class Structure:
++    """The known records of a complete snapshot, grouped by role."""
++
++    terminal: Any
++    screens: list[Sequence]
++    continuation: Any
++    histories: list[Sequence]
++
++
++class KnownRecords:
++    """Walk the known records in wire order, skipping unknown ones.
++
++    This mirrors the Zig decoder, which ignores records with unknown tags
++    wherever they appear. Their CRC32C values are still checked separately
++    by validate_record.
++    """
++
++    def __init__(self, snapshot: Any) -> None:
++        self.records = [
++            record
++            for record in snapshot.records
++            if record.header.tag in KNOWN_TAGS
++        ]
++        self.index = 0
++
++    def peek(self) -> int | None:
++        """Return the tag of the next known record, or None at the end."""
++        if self.index >= len(self.records):
++            return None
++        return self.records[self.index].header.tag
++
++    def take(self, tag: int) -> Any:
++        """Consume the next known record, which must have this tag."""
++        actual = self.peek()
++        if actual != tag:
++            raise ValueError(f"expected record tag {tag}, found {actual}")
++        record = self.records[self.index]
++        self.index += 1
++        return record
++
++    def take_sequence(self, tag: int, page_count: Any) -> Sequence:
++        """Consume a SCREEN or HISTORY record and the PAGE records it
++        declares. page_count reads the declared count from that record."""
++        record = self.take(tag)
++        pages = [self.take(TAG_PAGE) for _ in range(page_count(record))]
++        return Sequence(record, pages)
++
++
++def snapshot_structure(snapshot: Any) -> Structure:
++    """Group known records by role and validate their order."""
++    records = KnownRecords(snapshot)
++    terminal = records.take(TAG_TERMINAL)
++    screen_count = terminal.payload.header.screen_count
++
++    screens = [
++        records.take_sequence(
++            TAG_SCREEN,
++            lambda record: record.payload.header.page_count,
++        )
++        for _ in range(screen_count)
++    ]
++    continuation = records.take(TAG_CONTINUATION)
++    records.take(TAG_READY)
++    histories = [
++        records.take_sequence(
++            TAG_HISTORY,
++            lambda record: record.payload.page_count,
++        )
++        for _ in range(screen_count)
++    ]
++    records.take(TAG_FINISH)
++    if records.peek() is not None:
++        raise ValueError("records follow FINISH")
++
++    return Structure(
++        terminal=terminal,
++        screens=screens,
++        continuation=continuation,
++        histories=histories,
++    )
+ 
+ 
+ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
+     """Validate ordering relationships, record CRCs, and markers."""
++    structure = snapshot_structure(snapshot)
+     screen_keys = [
+-        sequence.screen.payload.header.key for sequence in snapshot.screens
++        sequence.record.payload.header.key for sequence in structure.screens
+     ]
+     history_keys = [
+-        sequence.history.payload.key for sequence in snapshot.histories
++        sequence.record.payload.key for sequence in structure.histories
+     ]
+     if len(set(screen_keys)) != len(screen_keys):
+         raise ValueError("complete snapshot contains a duplicate SCREEN key")
+@@ -217,7 +305,7 @@ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
+     if set(screen_keys) != set(history_keys):
+         raise ValueError("SCREEN and HISTORY keys do not match")
+ 
+-    terminal_header = snapshot.terminal.payload.header
++    terminal_header = structure.terminal.payload.header
+     expected_key_values = (
+         {0} if terminal_header.screen_count == 1 else {0, 1}
+     )
+@@ -229,11 +317,11 @@ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
+         )
+ 
+     screens_by_key = {
+-        sequence.screen.payload.header.key: sequence
+-        for sequence in snapshot.screens
++        sequence.record.payload.header.key: sequence
++        for sequence in structure.screens
+     }
+-    for sequence in snapshot.screens:
+-        header = sequence.screen.payload.header
++    for sequence in structure.screens:
++        header = sequence.record.payload.header
+         if (
+             header.cursor_x >= terminal_header.columns
+             or header.cursor_y >= terminal_header.rows
+@@ -244,8 +332,8 @@ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
+         ):
+             raise ValueError(f"SCREEN key {header.key}: invalid cursor position")
+ 
+-    for sequence in snapshot.histories:
+-        payload = sequence.history.payload
++    for sequence in structure.histories:
++        payload = sequence.record.payload
+         screen = screens_by_key[payload.key]
+         screen_rows = sum(
+             page.payload.header.rows for page in screen.pages
+@@ -259,16 +347,14 @@ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
+         history_rows = overlap_rows + sum(
+             page.payload.header.rows for page in sequence.pages
+         )
+-        if history_rows != screen.screen.payload.header.history_rows:
++        if history_rows != screen.record.payload.header.history_rows:
+             raise ValueError(
+                 f"SCREEN key {payload.key}: history_rows "
+-                f"{screen.screen.payload.header.history_rows} "
++                f"{screen.record.payload.header.history_rows} "
+                 f"does not match {history_rows}"
+             )
+ 
+-    for record in all_snapshot_records(snapshot):
+-        if not hasattr(record, "payload"):
+-            continue
++    for record in snapshot.records:
+         payload = record.payload
+         if not hasattr(payload, "styles"):
+             continue
+@@ -279,8 +365,9 @@ def validate_complete_snapshot(snapshot: Any, data: bytes) -> None:
+         if len(set(hyperlink_ids)) != len(hyperlink_ids):
+             raise ValueError("PAGE contains a duplicate hyperlink ID")
+ 
++    # Every record, including unknown ones, is framed and checksummed.
+     offset = SNAPSHOT_ENVELOPE_SIZE
+-    for record in all_snapshot_records(snapshot):
++    for record in snapshot.records:
+         offset = validate_record(record, data, offset)
+ 
+     if offset != len(data):
+-- 
+2.56.0
+

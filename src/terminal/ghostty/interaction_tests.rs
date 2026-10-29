@@ -145,6 +145,73 @@ fn native_search_navigation_wraps_older_and_newer_and_ignores_stale_generation()
 }
 
 #[test]
+fn history_progress_reuses_visible_and_selected_spans_until_completion() -> Result<()> {
+    let mut terminal = terminal(256, 3)?;
+    terminal.terminal.set_scrollback_max_bytes(None)?;
+    for _ in 0..1500 {
+        terminal.feed(b"hit\r\n");
+    }
+    terminal.feed(b"hit");
+    terminal.search(SearchCommand::Set {
+        query: "hit".into(),
+        generation: 1,
+    })?;
+    // A snapshot discovers the active matches while older pages still await
+    // incremental ticks. Select a visible match before that history completes.
+    terminal.annotations()?;
+    terminal.search(SearchCommand::Next { generation: 1 })?;
+    let initial = terminal.annotations()?.search.clone().context("search")?;
+    assert!(!initial.complete);
+    assert_ne!(initial.matches, Vec::new());
+    assert_ne!(initial.selected_match, Vec::new());
+    assert_eq!(initial.selected, Some(0));
+    let extractions = terminal.interaction.search_span_extractions;
+    let complete = caught_up(&mut terminal)?;
+    assert_eq!(complete.total, 1501);
+    assert!(complete.total > initial.total);
+    assert_eq!(complete.matches, initial.matches);
+    assert_eq!(complete.selected_match, initial.selected_match);
+    assert_eq!(complete.selected, initial.selected);
+    assert_eq!(terminal.interaction.search_span_extractions, extractions);
+    assert_reference_highlights(&mut terminal)?;
+    Ok(())
+}
+
+#[test]
+fn changed_output_refreshes_spans_even_when_count_selection_and_viewport_token_match() -> Result<()>
+{
+    let mut terminal = terminal(20, 3)?;
+    terminal.feed(b"hit");
+    query(&mut terminal, "hit", 1)?;
+    terminal.search(SearchCommand::Next { generation: 1 })?;
+    let before = terminal.annotations()?;
+    let previous = before.search.as_ref().context("search")?;
+    let extractions = terminal.interaction.search_span_extractions;
+    terminal.feed(b"\x1b[1;1H\x1b[2K\x1b[1;7Hhit");
+    let current = caught_up(&mut terminal)?;
+    assert_eq!(current.total, previous.total);
+    assert_eq!(current.selected, previous.selected);
+    assert_eq!(
+        terminal.annotations()?.viewport_token,
+        before.viewport_token
+    );
+    let expected = vec![CellSpan {
+        row: 0,
+        start: 6,
+        end: 9,
+    }];
+    assert_eq!(current.matches, expected);
+    assert_eq!(current.selected_match, expected);
+    assert_ne!(current.matches, previous.matches);
+    assert_eq!(
+        terminal.interaction.search_span_extractions,
+        extractions + 1
+    );
+    assert_reference_highlights(&mut terminal)?;
+    Ok(())
+}
+
+#[test]
 fn search_reconciles_output_alternate_screen_reflow_reset_and_pruning() -> Result<()> {
     let mut terminal = terminal(12, 3)?;
     terminal.feed(b"needle\r\n");

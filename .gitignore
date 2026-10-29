@@ -4,3 +4,6 @@
 # Local audit reports and evidence bundles
 /docs/audits/
 /docs/*audit*.md
+
+# GPUI artifact viewer design frames
+/.gpui-artifacts/

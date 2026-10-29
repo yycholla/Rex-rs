@@ -97,6 +97,25 @@ const ICONS: &[(&str, &str)] = &[
         icon_svg!(r#"<path d="M13 8a5 5 0 11-1.5-3.55M13 2.5v3h-3"/>"#),
     ),
     (
+        "icons/chevron-right.svg",
+        icon_svg!(r#"<path d="M6.5 4.5L10 8l-3.5 3.5"/>"#),
+    ),
+    (
+        "icons/more.svg",
+        icon_svg!(r#"<path d="M4 8h.01M8 8h.01M12 8h.01" stroke-width="2"/>"#),
+    ),
+    (
+        "icons/power.svg",
+        icon_svg!(r#"<path d="M8 2.5v5M4.8 4.6a4.5 4.5 0 106.4 0"/>"#),
+    ),
+    (
+        "icons/globe.svg",
+        icon_svg!(
+            r#"<circle cx="8" cy="8" r="5.5"/><path d="M2.5 8h11"/>"#,
+            r#"<path d="M8 2.5c1.6 1.8 1.6 9.2 0 11M8 2.5c-1.6 1.8-1.6 9.2 0 11"/>"#
+        ),
+    ),
+    (
         "icons/sidebar.svg",
         icon_svg!(r#"<rect x="2" y="3" width="12" height="10" rx="2"/><path d="M6 3v10"/>"#),
     ),

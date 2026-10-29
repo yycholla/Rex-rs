@@ -169,7 +169,9 @@ fn plan(
         selection: context.session_id.clone(),
     };
     match action {
-        NativeAction::Find
+        NativeAction::TogglePalette
+        | NativeAction::Quit
+        | NativeAction::Find
         | NativeAction::FindNext
         | NativeAction::FindPrevious
         | NativeAction::ToggleDetached

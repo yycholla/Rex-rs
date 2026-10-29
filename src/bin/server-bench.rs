@@ -106,6 +106,8 @@ fn response(size: GridSize) -> Result<Response> {
                 pane,
                 PaneSnapshot {
                     frame: Arc::new(TerminalFrame {
+                        images: Arc::default(),
+                        graphics_warning: None,
                         size,
                         rows,
                         cursor: Some(Cursor {

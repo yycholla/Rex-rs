@@ -95,6 +95,7 @@ not create a session, launch a shell or claim another client's blocks on attachm
 | Ctrl+Shift+W | Close focused pane |
 | Ctrl+Alt+Shift+W | Close selected tab |
 | Ctrl+Alt+W | Close selected session |
+| Ctrl+Shift+P | Command palette |
 | Ctrl+Shift+Q | Quit |
 
 Click a session or tab to select it, click a terminal to focus it, and drag to
@@ -126,14 +127,63 @@ mise exec -- cargo run --locked --bin rex-rs -- --endpoint unix:///path/to/serve
 
 Endpoint precedence is `--endpoint`, `REX_RS_ENDPOINT`, `REX_RS_REX_ENDPOINT`,
 `REX_SERVER`, then `$XDG_RUNTIME_DIR/rex/server.sock` (or
-`/run/user/<uid>/rex/server.sock` when XDG runtime is unset). Only local Unix
-endpoints are supported. The implemented control API is revision 7; incompatible
+`/run/user/<uid>/rex/server.sock` when XDG runtime is unset). Unix sockets and explicit HTTP(S)/WS(S)
+origins are supported; network access must already be authorized by the Rex server. The implemented control API is revision 7; incompatible
 servers produce an explicit error. The server serves its exact protocol at
 `GET /llms.txt` over the same endpoint.
 
+### Multiple servers
+
+The sidebar lists every server with its sessions and tabs beneath it, so several
+connections stay visible at once. Each server keeps independent terminal
+replicas, input queues and reconnect state; choosing a tab on another server
+presents that server's workspace. A server's header shows its connection state:
+failed connections show their cause with **Retry**, and disconnected servers
+collapse to one row. Hover a header for **New session** and the **…** menu
+(Reconnect, Disconnect, Remove).
+
+At startup, the desktop reads saved hosts from the initial Rex server's
+`hosts.list` API and connects to supported endpoints automatically. Bare saved
+host names use HTTPS; automatic fallback to alternate ports/protocols is not yet
+implemented. **Discover servers** (↻) reads the currently selected server's saved
+hosts again. **Add server** (+) lets you enter a name and address directly; no
+launch flag is required. Add/remove changes apply to this desktop run and do not
+change Rex's saved host registry. **Disconnect** detaches this client without
+stopping remote programs; **Connect** reattaches it. Up to 16 entries can be shown.
+
+A server reachable only over SSH can be added as `user@host` or
+`ssh://user@host[:port][/remote/server.sock]`. The desktop asks the remote
+`rex server status` for its socket (starting a missing server, as the CLI does),
+forwards it to a private socket under `$XDG_RUNTIME_DIR/rex-rs/`, and connects
+through that. SSH runs non-interactively with your keys and agent: trust the
+host key and set up key authentication with `ssh` in a terminal first.
+Disconnecting or removing the server stops the forward, and it also ends if the
+desktop exits.
+
+Optional repeated `--endpoint` arguments seed the same list. With no explicit
+endpoint, environment/default selection above supplies the initial connection.
+Any `--client-script` files apply to each connected server, so use scripts intended
+for all selected and discovered hosts. Inactive workspaces cannot steal focus,
+change the clipboard or accept local input; their UI actions receive an explicit
+inactive-workspace error. Selecting a server restores its workspace.
+
+Use `--server NAME=ADDRESS` to opt explicitly named connections into Lua
+cross-server calls. Unnamed `--endpoint` connections stay isolated:
+
+```sh
+rex-rs --server local=unix:///run/user/1000/rex/server.sock \
+  --server staging=https://rex.example.net
+```
+
+Named connections advertise other connected server names to `client.action`.
+Calls route only to those configured connections; callback payloads cannot supply
+new endpoints. Reconnecting retires the old route identity. Failed or uncertain
+requests are not replayed. This does not add saved profiles or authentication UI.
+
+
 ### Client automation
 
-The desktop advertises 35 native actions through Rex, including session/tab/pane
+The desktop advertises 37 native actions through Rex, including session/tab/pane
 commands, pane movement/swapping, tab reordering, font size, sidebar visibility,
 copy/paste, terminal history search, key modes, detached blocks and configuration reload.
 Use the desktop's client ID from `rex client ls`:
@@ -173,7 +223,7 @@ The desktop applies Rex's merged keymap, including configuration overrides and
 removals, Lua/block actions, key sequences and stacked key modes. Escape cancels a
 sequence or leaves a mode; exclusive modes consume unbound keys. Configuration
 reload updates bindings without restarting the desktop. Diagnostics appear above
-the terminal. Ctrl+Shift+Q remains reserved for quitting.
+the terminal. Quit and the command palette use the same configurable bindings as other native actions.
 
 Load client-specific Lua sources in order with repeatable command-line options:
 
@@ -187,13 +237,26 @@ again for a new server/client identity, without reexecuting them on ordinary
 connection resume. Files are read at desktop startup; configuration reload does
 not reread those files.
 
-The pinned GPUI input API lacks actual hardware codes and erases Shift for symbol
-keys. Physical bindings and shifted punctuation therefore remain unsupported by
-the desktop adapter. Cross-server callbacks and callbacks requiring the worker
-while it awaits the originating Lua action also remain outside current coverage;
-the latter receive an explicit refusal rather than hanging. Copy now needs the
-terminal worker for native selection formatting, so a nested Lua callback to
-`client.copy` is refused while that worker waits for the originating Lua action.
+The vendored GPUI 0.2.2 patch preserves Linux XKB physical positions, unshifted
+symbols and raw modifiers for shortcut resolution. Text and IME delivery still
+use GPUI's original path. Unknown XKB key names have no physical mapping.
+Ctrl+Shift+P opens a searchable palette from the registered native actions.
+
+While Lua actions await a response, the worker continues decoding existing
+terminal streams and can service a nested selection-copy callback. Nested
+callbacks that need further ordered mutations still receive an explicit refusal;
+cross-server routing requires named connections as described below.
+
+Floating layers retain server bounds and stacking order. Use **Float pane** in a
+pane header, drag its floating header to move it, or drag the lower-right corner
+to resize it. Layer controls raise, lower or close it through Rex. Closing a
+layer closes its contents; dragging commits once on release.
+
+Ctrl-click an OSC 8 hyperlink to open HTTP, HTTPS or mail links. Other URI schemes
+are rejected. Program clipboard writes use authoritative Rex clipboard events,
+including chunked transfers; only the focused terminal in the active, nonmodal
+window can update the local clipboard. Terminal snapshots cannot trigger writes,
+and clipboard-read requests never expose the local clipboard to programs.
 
 ### Development logs
 
@@ -222,8 +285,11 @@ start`, follow its captured logs with `rex server logs --follow`. A foreground
 
 The worker bootstraps and attaches, fetches newer authoritative views on events,
 and restores each terminal's Ghostty snapshot before applying ordered VT output.
-Optional Kitty image records are checksum-validated and omitted during import;
-their text/history state remains available, while image rendering is unsupported.
+Kitty image records are restored by the vendored native snapshot backport.
+Owned image pixels and placements support raw/PNG images, cropping, layering
+and visible animation. Native storage is limited to 16 MiB per screen, owned
+visible pixels to 16 MiB, dimensions to 4096 pixels and placements to 4096;
+omitted graphics leave terminal text usable.
 Malformed snapshots stop retries for that pane until the desktop reconnects.
 Ghostty stays on that worker; the UI receives owned frames. Keyboard requests go
 through `client.key` so Rex Lua bindings can handle them, and paste uses block
@@ -288,13 +354,18 @@ frame copies.
 Owned row identities and prepared glyphs are reused as rows scroll. See
 [performance diagnostics](docs/performance.md) for the tested boundaries.
 
-The current renderer supports tiled terminal layouts, including arbitrary split
-fractions. Floating layers and unsupported block creators are disclosed explicitly
-and never coerced into a different server layout. Empty sessions/windows are safe.
+When italic text has no usable styled glyph, the renderer retries only the missing
+clusters with available upright faces. This keeps CJK readable while preserving
+working styled text, combining characters and cell widths; it does not synthesize
+an italic slant. General mixed-script and font coverage remain under validation.
+
+The current renderer supports tiled and floating terminal layouts, including
+arbitrary split fractions. Unsupported block creators remain explicit and never
+get coerced into a different server layout. Empty sessions/windows are safe.
 Up to 16 placed terminal streams are decoded at once, prioritizing the active
 window; individual viewports are bounded to 65,536 cells and snapshots to 64 MiB.
-Full nonterminal block rendering, floating-layer interaction, graphics and remote connection setup
-remain future work. Detached blocks retain metadata without a local terminal
+Nonterminal block rendering, semantic accessibility and broader real IME
+validation remain future work. Detached blocks retain metadata without a local terminal
 stream; placement restores their display from Rex's current snapshot. Managing a
 nonterminal block's placement does not add a renderer for its contents.
 
@@ -311,3 +382,10 @@ they are not used or started by the desktop. See [legacy local server notes](doc
 and [terminal protocol notes](docs/rex-terminal-protocol.md). Legacy performance
 measurements in [performance.md](docs/performance.md) describe the custom backend;
 they are not performance claims about this native Rex path.
+
+## GitHub CI
+
+Pushes to `main` and pull requests run formatting, compilation, strict Clippy,
+unit/core tests and headless smoke checks. Native Rex interoperability requires
+the separate manual job on a provisioned runner. See [CI setup](.github/README.md)
+for coverage and runner requirements.

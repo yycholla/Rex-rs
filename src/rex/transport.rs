@@ -1,12 +1,14 @@
-//! Persistent ordered Rex control transport over a local Unix socket.
-use super::protocol::{self, MAX_MESSAGE_BYTES, MAX_PENDING_EVENT_BYTES, MAX_PENDING_EVENTS};
+//! Persistent ordered Rex control transport over Unix, TCP or verified TLS.
+use super::{
+    endpoint::{Endpoint, RexStream, SocketInterrupt},
+    protocol::{self, MAX_MESSAGE_BYTES, MAX_PENDING_EVENT_BYTES, MAX_PENDING_EVENTS},
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
     io::ErrorKind,
-    os::unix::net::UnixStream,
     path::PathBuf,
     pin::Pin,
     sync::{
@@ -28,7 +30,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(32);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Resolve the local endpoint without launching a server or invoking a CLI.
+/// Resolve a configured endpoint without launching a server or invoking a CLI.
 ///
 /// # Errors
 /// Rejects a relative runtime directory or missing endpoint environment.
@@ -37,10 +39,7 @@ pub fn default_endpoint() -> Result<String> {
         .or_else(|_| std::env::var("REX_RS_REX_ENDPOINT"))
         .or_else(|_| std::env::var("REX_SERVER"))
     {
-        ensure!(
-            endpoint.starts_with("unix:///"),
-            "Rex endpoint must be an absolute unix:// endpoint"
-        );
+        Endpoint::parse(&endpoint)?;
         return Ok(endpoint);
     }
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
@@ -54,31 +53,20 @@ pub fn default_endpoint() -> Result<String> {
     ))
 }
 
-/// Open an uncompressed WebSocket using Unix peer credentials.
+/// Open an uncompressed WebSocket using the configured transport identity.
 ///
 /// # Errors
-/// Reports invalid endpoints, unavailable servers and invalid upgrade replies.
+/// Reports invalid origins, unavailable servers, TLS verification and access denial.
 pub fn open_websocket(
     endpoint: &str,
     path: &str,
     subprotocol: &str,
-) -> Result<WebSocket<UnixStream>> {
-    let socket_path = endpoint
-        .strip_prefix("unix://")
-        .context("only local unix:// Rex endpoints are supported")?;
-    ensure!(
-        std::path::Path::new(socket_path).is_absolute(),
-        "Rex socket path must be absolute"
-    );
-    ensure!(
-        path.starts_with('/') && !path.contains(['\r', '\n']),
-        "invalid Rex WebSocket path"
-    );
-    let stream = UnixStream::connect(socket_path)
-        .with_context(|| format!("connect to Rex at {endpoint}"))?;
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let mut request = format!("ws://rex{path}").into_client_request()?;
+) -> Result<WebSocket<RexStream>> {
+    let endpoint = Endpoint::parse(endpoint)?;
+    let url = endpoint.websocket_url(path)?;
+    let stream = endpoint.connect(HANDSHAKE_TIMEOUT)?;
+    let _deadline = stream.handshake_guard(HANDSHAKE_TIMEOUT)?;
+    let mut request = url.into_client_request()?;
     request.headers_mut().insert(
         "Sec-WebSocket-Protocol",
         HeaderValue::from_str(subprotocol)?,
@@ -90,7 +78,17 @@ pub fn open_websocket(
         .max_message_size(Some(MAX_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_MESSAGE_BYTES));
     let (socket, response) = client_with_config(request, stream, Some(config))
-        .map_err(|error| anyhow::anyhow!("Rex WebSocket handshake: {error}"))?;
+        .map_err(|error| match error {
+            tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response)) => {
+                let status = response.status();
+                if matches!(status.as_u16(), 401 | 403) {
+                    anyhow::anyhow!("Rex access denied (HTTP {status}); check the server's transport identity and Tailscale access rules")
+                } else {
+                    anyhow::anyhow!("Rex WebSocket upgrade rejected (HTTP {status}); redirects are not followed")
+                }
+            }
+            error => anyhow::anyhow!("Rex WebSocket handshake: {error}"),
+        })?;
     ensure!(
         response
             .headers()
@@ -338,7 +336,7 @@ fn request_timeout(method: &str) -> Duration {
 pub struct ControlConnection {
     welcome: Value,
     handle: ControlHandle,
-    interrupt: UnixStream,
+    interrupt: SocketInterrupt,
     last_response_seq: u64,
 }
 
@@ -357,6 +355,7 @@ impl ControlConnection {
     /// Reports connection, handshake and incompatible API errors.
     pub fn connect_with_resume(endpoint: &str, token: Option<&str>) -> Result<Self> {
         let mut socket = open_websocket(endpoint, "/api/control", "rex.control.v1")?;
+        let deadline = socket.get_ref().handshake_guard(HANDSHAKE_TIMEOUT)?;
         let mut hello = protocol::hello();
         if let Some(token) = token {
             hello["reconnect_token"] = Value::String(token.to_owned());
@@ -389,7 +388,8 @@ impl ControlConnection {
             config.max_message_size = Some(limit);
             config.max_frame_size = Some(limit);
         });
-        let interrupt = socket.get_ref().try_clone()?;
+        drop(deadline);
+        let interrupt = socket.get_ref().interrupt_handle()?;
         let handle = start_io(socket, limit)?;
         Ok(Self {
             welcome,
@@ -528,7 +528,7 @@ struct CallbackJob {
     event: Value,
 }
 
-fn start_io(socket: WebSocket<UnixStream>, message_limit: usize) -> Result<ControlHandle> {
+fn start_io(socket: WebSocket<RexStream>, message_limit: usize) -> Result<ControlHandle> {
     let shared = Arc::new(Shared {
         state: Mutex::new(ConnectionState {
             next_id: 1,
@@ -575,7 +575,7 @@ impl Drop for IoGuard {
 }
 
 fn io_loop(
-    mut socket: WebSocket<UnixStream>,
+    mut socket: WebSocket<RexStream>,
     requests: &Receiver<WireRequest>,
     replies: &Receiver<WireRequest>,
     handle: &ControlHandle,
@@ -717,15 +717,13 @@ fn dispatch_event(
     let call_id = payload["payload"]["call_id"]
         .as_str()
         .context("Rex callback lacks call_id")?;
-    if kind == Some("client_perform_requested")
-        && let Some(handler) = handler
-    {
+    if let Some(handler) = handler {
         callbacks
             .try_send(CallbackJob { handler, event })
             .map_err(|_| anyhow::anyhow!("Rex callback queue exceeded its limit"))?;
     } else {
-        // Cross-server calls remain unsupported; absent native handlers retain
-        // the old prompt rejection. Their acknowledgements use normal IDs.
+        // Without an installed callback handler, acknowledge unsupported work
+        // promptly rather than leaving the originating action waiting.
         let _reply = handle.request("client.reply", serde_json::json!({
             "call_id":call_id,
             "error":{"code":"not_supported","message":"This client does not provide this remote client action"}
@@ -734,17 +732,27 @@ fn dispatch_event(
     Ok(())
 }
 
-fn read_value(socket: &mut WebSocket<UnixStream>, timeout: Duration) -> Result<Option<Value>> {
+fn read_value(socket: &mut WebSocket<RexStream>, timeout: Duration) -> Result<Option<Value>> {
     if timeout.is_zero() {
         return Ok(None);
     }
-    let deadline = Instant::now() + timeout;
+    // A socket read timeout restarts for each received chunk. Nonblocking reads
+    // let the absolute budget win even when a peer trickles a fragmented frame.
+    // Tungstenite retains partial frames across calls; restore blocking writes
+    // before returning to the ordered request sender.
+    socket.get_mut().set_nonblocking(true)?;
+    let result = read_value_until(socket, Instant::now() + timeout);
+    let restored = socket.get_mut().set_nonblocking(false);
+    restored.context("restore Rex control socket mode")?;
+    result
+}
+
+fn read_value_until(socket: &mut WebSocket<RexStream>, deadline: Instant) -> Result<Option<Value>> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Ok(None);
         }
-        socket.get_mut().set_read_timeout(Some(remaining))?;
         match socket.read() {
             Ok(Message::Text(text)) => {
                 let value: Value =
@@ -757,13 +765,15 @@ fn read_value(socket: &mut WebSocket<UnixStream>, timeout: Duration) -> Result<O
                     return Ok(Some(value));
                 }
             }
-            Ok(Message::Ping(_) | Message::Pong(_)) => socket.flush()?,
+            // Tungstenite queues pongs and flushes them on the next read. A
+            // nonblocking flush may have to wait without discarding its buffer.
+            Ok(Message::Ping(_) | Message::Pong(_)) => {}
             Ok(Message::Close(_)) => bail!("Rex closed the control connection"),
             Ok(_) => bail!("Rex control connection sent a non-JSON message"),
             Err(tungstenite::Error::Io(error))
                 if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
             {
-                return Ok(None);
+                thread::sleep(remaining.min(Duration::from_millis(1)));
             }
             Err(error) => return Err(error).context("read Rex control connection"),
         }
@@ -774,6 +784,7 @@ fn read_value(socket: &mut WebSocket<UnixStream>, timeout: Duration) -> Result<O
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::os::unix::net::UnixStream;
     use std::{
         fs,
         os::unix::{fs::PermissionsExt, net::UnixListener},
@@ -1205,10 +1216,112 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_endpoints_fail_before_connecting() {
-        assert!(
-            open_websocket("https://example.invalid", "/api/control", "rex.control.v1").is_err()
+    fn partial_welcome_returns_on_deadline_and_resumes_without_loss() -> Result<()> {
+        use std::io::Write;
+        use tungstenite::protocol::Role;
+        let (client, mut peer) = UnixStream::pair()?;
+        let mut socket = WebSocket::from_raw_socket(RexStream::Unix(client), Role::Client, None);
+        let welcome = br#"{"type":"welcome"}"#;
+        peer.write_all(&[0x81, u8::try_from(welcome.len())?])?;
+        let producer = thread::spawn(move || -> Result<()> {
+            for byte in welcome {
+                peer.write_all(&[*byte])?;
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        });
+        let start = Instant::now();
+        assert!(read_value(&mut socket, Duration::from_millis(15))?.is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            read_value(&mut socket, Duration::from_secs(1))?,
+            Some(json!({"type":"welcome"}))
         );
+        producer
+            .join()
+            .map_err(|_| anyhow::anyhow!("welcome peer panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_endpoints_fail_before_connecting() {
+        assert!(open_websocket("ftp://example.invalid", "/api/control", "rex.control.v1").is_err());
         assert!(open_websocket("unix://relative.sock", "/api/control", "rex.control.v1").is_err());
+    }
+
+    #[test]
+    fn remote_http_and_ws_use_exact_control_contract() -> Result<()> {
+        for scheme in ["http", "ws"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let peer = thread::spawn(move || -> Result<()> {
+                let (stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+                #[expect(
+                    clippy::result_large_err,
+                    reason = "Tungstenite's handshake callback owns its HTTP response."
+                )]
+                let mut socket =
+                    accept_hdr(stream, |request: &Request, mut response: Response| {
+                        assert_eq!(request.uri().path(), "/api/control");
+                        assert_eq!(
+                            request.headers()["Sec-WebSocket-Protocol"],
+                            "rex.control.v1"
+                        );
+                        assert!(request.headers().get("Authorization").is_none());
+                        assert!(request.headers().get("Sec-WebSocket-Extensions").is_none());
+                        response.headers_mut().insert(
+                            "Sec-WebSocket-Protocol",
+                            HeaderValue::from_static("rex.control.v1"),
+                        );
+                        Ok(response)
+                    })?;
+                let hello: Value = serde_json::from_str(socket.read()?.to_text()?)?;
+                ensure!(hello["type"] == "hello", "expected hello");
+                socket.send(Message::Text(json!({"type":"welcome","protocol":"rex.control.v1","api_revision":7,"client":{"id":"client:tcp"}}).to_string().into()))?;
+                let request: Value = serde_json::from_str(socket.read()?.to_text()?)?;
+                ensure!(request["method"] == "session.list", "unexpected method");
+                socket.send(Message::Text(
+                    json!({"type":"response","id":request["id"],"seq":3,"payload":{"sessions":[]}})
+                        .to_string()
+                        .into(),
+                ))?;
+                Ok(())
+            });
+            let mut connection = ControlConnection::connect(&format!("{scheme}://{address}"))?;
+            assert_eq!(
+                connection.call("session.list", Value::Null)?,
+                json!({"sessions":[]})
+            );
+            assert_eq!(connection.last_response_seq(), 3);
+            drop(connection);
+            peer.join()
+                .map_err(|_| anyhow::anyhow!("TCP peer panicked"))??;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remote_access_denial_is_explicit_and_does_not_forward_body() -> Result<()> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let peer = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+            let mut request = [0; 4096];
+            ensure!(stream.read(&mut request)? > 0, "missing upgrade request");
+            stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 19\r\nConnection: close\r\n\r\nprivate-server-info")?;
+            Ok(())
+        });
+        let error = ControlConnection::connect(&format!("http://{address}"))
+            .err()
+            .context("denied endpoint was accepted")?;
+        let message = format!("{error:#}");
+        assert!(message.contains("access denied"), "{message}");
+        assert!(!message.contains("private-server-info"));
+        peer.join()
+            .map_err(|_| anyhow::anyhow!("TCP peer panicked"))??;
+        Ok(())
     }
 }

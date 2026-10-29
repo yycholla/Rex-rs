@@ -357,3 +357,53 @@ Final validation passed `mise run verify`: formatting, all-target compilation,
 strict Clippy, **87 unit tests**, and all five Ghostty/input/PTY/server/CLI smoke
 executables. Timing benchmarks and the isolated Wayland workload were additional
 diagnostics rather than pass/fail timing thresholds.
+
+## Search-stage diagnostics
+
+Set `REX_RS_SEARCH_STATS=1` to log owner-thread elapsed time in explicit feed,
+history tick, snapshot (including its implicit feed), native viewport-match list
+collection and match-to-span conversion. Reports contain no query or terminal text.
+They aggregate durations and call counts since the preceding report, in that order;
+they are not CPU samples. Reports are rate-limited and emitted during span
+extraction, so hidden/cached-history work can remain unreported until a later
+extraction or shutdown. Do not sum them as complete run totals. Unset the variable
+for latency measurements.
+
+Visible search spans are now retained across history-only progress. Output,
+query/navigation, scrolling, resize, reveal and observed viewport changes invalidate
+them. Due visible refreshes use snapshot's feed before the tick, avoiding an
+immediately redundant explicit feed. Progress counts still advance independently,
+and only owned spans cross mutation boundaries. Native feed/tick, query replacement
+and snapshot match collection remain synchronous; this is not hard input isolation.
+
+The same retained stress workload was run once before and once after this change:
+2,000 seeded dense rows at 350 columns, continued matching output, and 40 echo
+samples in a second visible pane. Each run uses its own private Rex server.
+
+| Input enqueue to client cache | Before | Final |
+| --- | ---: | ---: |
+| p50 | 59.44 ms | 39.43 ms |
+| p95 | 143.31 ms | 94.22 ms |
+| Maximum | 159.30 ms | 146.22 ms |
+| Search cancellation | 9.49 ms | 9.53 ms |
+
+The final search completed with 755,440 matches, no producer input, exactly 41 echo
+bytes and unchanged layout revision. Different run durations under continued
+output explain differing total match counts. Query replacements remain approximately
+95–169 ms, and navigation 72–76 ms. Native allocation/search calls remain synchronous.
+Single-run timing variation, producer scheduling and shared worker contention limit
+attribution; this is a measured improvement on this workload, not a general latency
+guarantee or a GUI/display measurement. The independent exploratory candidate run
+is retained separately and is not substituted for the final-source result.
+
+The full integration gate passes 271 tests and every smoke executable. New tests
+verify complete history discovery while visible/selected spans remain exact with
+no extra extraction, and fresh spans after output moves a match without changing
+count, selected index or viewport identity. Existing reflow, screen switch, pruning,
+query/cancellation and reveal checks remain passing. Local evidence is under
+`docs/audits/rex-20261028/search-worker/`.
+
+The rebuilt isolated X11 search fixture also passes: keyboard/native actions,
+Unicode/soft-wrap and cross-history copy, Shift override, release/blur cleanup and
+unchanged server input/size/owner/PID. Broader Wayland/IME and general desktop load
+remain unverified.

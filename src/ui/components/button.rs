@@ -35,6 +35,10 @@ pub enum Icon {
     Server,
     Lock,
     Refresh,
+    ChevronRight,
+    More,
+    Power,
+    Globe,
 }
 
 impl Icon {
@@ -56,6 +60,10 @@ impl Icon {
             Self::Server => "icons/server.svg",
             Self::Lock => "icons/lock.svg",
             Self::Refresh => "icons/refresh.svg",
+            Self::ChevronRight => "icons/chevron-right.svg",
+            Self::More => "icons/more.svg",
+            Self::Power => "icons/power.svg",
+            Self::Globe => "icons/globe.svg",
         }
     }
 }

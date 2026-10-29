@@ -109,15 +109,24 @@ impl BlockView {
     }
 }
 
-/// Retains all layers even when the existing tiled renderer cannot draw them.
+/// An authoritative layer in back-to-front server order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayerView {
     pub remote_id: String,
     pub kind: String,
     pub bounds: [f64; 4],
     pub raw_layout: Value,
+    pub layout: Option<ViewLayout>,
     pub blocks: Vec<PaneId>,
     pub unsupported: Option<String>,
+}
+
+impl LayerView {
+    /// The protocol renders unknown future layer kinds as floating.
+    #[must_use]
+    pub fn is_floating(&self) -> bool {
+        self.kind != "tiled"
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -177,6 +186,30 @@ impl WindowView {
     #[must_use]
     pub const fn zoomed_pane(&self) -> Option<PaneId> {
         self.zoomed
+    }
+
+    /// All placed blocks, including floating and unsupported-content blocks.
+    #[must_use]
+    pub fn placed_panes(&self) -> Vec<PaneId> {
+        self.layers
+            .iter()
+            .flat_map(|layer| layer.blocks.iter().copied())
+            .collect()
+    }
+
+    /// Panes requiring frames for this window, honoring server zoom.
+    #[must_use]
+    pub fn visible_panes(&self) -> Vec<PaneId> {
+        self.zoomed.map_or_else(
+            || {
+                self.layers
+                    .iter()
+                    .filter_map(|layer| layer.layout.as_ref())
+                    .flat_map(ViewLayout::panes)
+                    .collect()
+            },
+            |pane| vec![pane],
+        )
     }
 }
 
@@ -874,6 +907,7 @@ impl WorkspaceState {
                 blocks.push(pane);
             }
             let bounds = rectangle(&layer["bounds"])?;
+            validate_layer_bounds(bounds)?;
             let kind = text(layer, "kind")?.to_owned();
             let raw_layout = layer.get("layout").cloned().unwrap_or(Value::Null);
             validate_layer_layout(&raw_layout, &blocks, &self.remote_ids, split_ids)?;
@@ -883,21 +917,19 @@ impl WorkspaceState {
                 self.parse_layout(&raw_layout, session_id, &blocks, 0)
                     .map(Some)
             };
-            let mut unsupported = None;
-            match parsed {
-                Ok(parsed) if kind == "tiled" && layers.is_empty() => layout = parsed,
-                Ok(_) => {
-                    unsupported = Some(format!(
-                        "{kind} layer is not supported by the tiled renderer"
-                    ));
-                }
-                Err(error) => unsupported = Some(error.to_string()),
+            let (parsed, unsupported) = match parsed {
+                Ok(parsed) => (parsed, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            if kind == "tiled" && layers.is_empty() {
+                layout.clone_from(&parsed);
             }
             layers.push(LayerView {
                 remote_id: layer_id,
                 kind,
                 bounds,
                 raw_layout,
+                layout: parsed,
                 blocks,
                 unsupported,
             });
@@ -1095,6 +1127,11 @@ impl WorkspaceState {
             }
             Command::MoveWindow { window, before } => self.move_window_command(*window, *before)?,
             Command::RestorePane { pane, title } => self.restore_pane_command(*pane, title)?,
+            Command::FloatPane { pane, bounds } => self.float_pane_command(*pane, *bounds)?,
+            Command::ResizeLayer { .. }
+            | Command::RaiseLayer { .. }
+            | Command::LowerLayer { .. }
+            | Command::CloseLayer { .. } => self.layer_command(command)?,
             Command::NextWindow => (
                 "session.focus_next_window",
                 json!({"session_id":active()?.remote_id}),
@@ -1129,6 +1166,60 @@ impl WorkspaceState {
             }
         };
         Ok(Some(ApiCall { method, params }))
+    }
+
+    fn float_pane_command(&self, pane: PaneId, bounds: [f64; 4]) -> Result<(&'static str, Value)> {
+        validate_layer_bounds(bounds)?;
+        let block = self.pane(pane).context("Rex block is no longer present")?;
+        let layer = self
+            .sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .flat_map(|window| &window.layers)
+            .find(|layer| layer.blocks.contains(&pane))
+            .context("Rex block is not placed")?;
+        ensure!(!layer.is_floating(), "Rex block is already floating");
+        Ok((
+            "session.float_block",
+            json!({"session_id":block.session_id,"block_id":block.remote_id,"bounds":bounds}),
+        ))
+    }
+
+    fn layer_command(&self, command: &Command) -> Result<(&'static str, Value)> {
+        let (session, layer, method, bounds) = match command {
+            Command::ResizeLayer {
+                session,
+                layer,
+                bounds,
+            } => (*session, layer, "session.resize_layer", Some(*bounds)),
+            Command::RaiseLayer { session, layer } => {
+                (*session, layer, "session.raise_layer", None)
+            }
+            Command::LowerLayer { session, layer } => {
+                (*session, layer, "session.lower_layer", None)
+            }
+            Command::CloseLayer { session, layer } => {
+                (*session, layer, "session.close_layer", None)
+            }
+            _ => bail!("invalid Rex layer command"),
+        };
+        let session = self.session(session)?;
+        let layer = session
+            .windows
+            .iter()
+            .flat_map(|window| &window.layers)
+            .find(|candidate| candidate.remote_id == *layer)
+            .context("Rex layer is no longer present in session")?;
+        ensure!(
+            layer.is_floating(),
+            "Rex tiled layer cannot be moved or closed independently"
+        );
+        let mut params = json!({"session_id":session.remote_id,"layer_id":layer.remote_id});
+        if let Some(bounds) = bounds {
+            validate_layer_bounds(bounds)?;
+            params["bounds"] = json!(bounds);
+        }
+        Ok((method, params))
     }
 
     /// The executor must finish restoration by moving the existing block beside
@@ -1314,6 +1405,24 @@ fn rectangle(value: &Value) -> Result<[f64; 4]> {
         "negative layer dimensions"
     );
     Ok(bounds)
+}
+
+/// Mutation bounds use the live API's normalized, inside-window contract.
+fn validate_layer_bounds([x, y, width, height]: [f64; 4]) -> Result<()> {
+    ensure!(
+        [x, y, width, height].iter().all(|value| value.is_finite()),
+        "nonfinite floating layer bounds"
+    );
+    ensure!(
+        x >= 0.0
+            && y >= 0.0
+            && width > 0.0
+            && height > 0.0
+            && x + width <= 1.0
+            && y + height <= 1.0,
+        "floating layer bounds must fit inside the window"
+    );
+    Ok(())
 }
 
 /// Check the complete remote tree before allocating a representable UI tree.
@@ -2089,12 +2198,184 @@ mod tests {
             .active_window()
             .context("window")?;
         assert!(window.layout().is_none());
-        assert!(window.layers[0].unsupported.is_some());
+        assert!(window.layers[0].unsupported.is_none());
+        assert!(window.layers[0].layout.is_some());
+        assert_eq!(window.visible_panes(), state.placed_pane_ids());
         assert!(
             !state
                 .pane(state.pane_ids()[0])
                 .context("pane")?
                 .is_terminal()
+        );
+        Ok(())
+    }
+
+    fn floating_view() -> Value {
+        let mut value = view(1);
+        let mut layer = value["windows"][0]["layers"][0].clone();
+        layer["layer_id"] = json!("layer:b");
+        layer["kind"] = json!("floating");
+        layer["bounds"] = json!([0.125, 0.25, 0.5, 0.625]);
+        layer["layout"]["block_id"] = json!("block:b");
+        layer["layout"]["rect"] = layer["bounds"].clone();
+        layer["blocks"][0]["block_id"] = json!("block:b");
+        value["windows"][0]["layers"] = json!([value["windows"][0]["layers"][0], layer]);
+        value
+    }
+
+    #[test]
+    fn floating_layers_keep_order_bounds_and_aliases_with_zoom_and_empty_tiled_layer() -> Result<()>
+    {
+        let mut state = WorkspaceState::default();
+        let mut value = floating_view();
+        state.apply_view(&value)?;
+        let window = state
+            .active_session()
+            .context("session")?
+            .active_window()
+            .context("window")?;
+        let tiled = window.layers[0].blocks[0];
+        let floating = window.layers[1].blocks[0];
+        assert_eq!(window.visible_panes(), vec![tiled, floating]);
+        assert_eq!(window.placed_panes(), vec![tiled, floating]);
+        assert_eq!(window.layers[1].bounds, [0.125, 0.25, 0.5, 0.625]);
+        assert_eq!(
+            window.layers[1]
+                .layout
+                .as_ref()
+                .context("floating layout")?
+                .panes(),
+            vec![floating]
+        );
+        value["revision"] = json!(2);
+        value["windows"][0]["zoomed_block_id"] = json!("block:b");
+        state.apply_view(&value)?;
+        assert_eq!(
+            state
+                .active_session()
+                .context("session")?
+                .active_window()
+                .context("window")?
+                .visible_panes(),
+            vec![floating]
+        );
+        value["revision"] = json!(3);
+        value["windows"][0]["zoomed_block_id"] = Value::Null;
+        value["windows"][0]["focused_block_id"] = json!("block:b");
+        value["windows"][0]["layers"][0]["layout"] = Value::Null;
+        value["windows"][0]["layers"][0]["blocks"] = json!([]);
+        value["windows"][0]["layers"][1]["kind"] = json!("future-overlay");
+        state.apply_view(&value)?;
+        let window = state
+            .active_session()
+            .context("session")?
+            .active_window()
+            .context("window")?;
+        assert!(window.layout().is_none());
+        assert_eq!(window.visible_panes(), vec![floating]);
+        assert_eq!(window.layers[0].remote_id, "layer:a");
+        assert!(window.layers[1].is_floating());
+        Ok(())
+    }
+
+    #[test]
+    fn floating_commands_validate_membership_bounds_and_preserve_exact_fractions() -> Result<()> {
+        let mut state = WorkspaceState::default();
+        state.apply_view(&floating_view())?;
+        let session = state.active_session().context("session")?;
+        let session_id = session.id();
+        let window = session.active_window().context("window")?;
+        let tiled = window.layers[0].blocks[0];
+        let floating = window.layers[1].blocks[0];
+        let bounds = [1.0 / 7.0, 0.2, 0.5, 0.6];
+        let call = state
+            .command(&Command::FloatPane {
+                pane: tiled,
+                bounds,
+            })?
+            .context("float call")?;
+        assert_eq!(call.method, "session.float_block");
+        assert_eq!(call.params["block_id"], "block:a");
+        assert_eq!(call.params["bounds"], json!(bounds));
+        assert!(
+            state
+                .command(&Command::FloatPane {
+                    pane: floating,
+                    bounds
+                })
+                .is_err()
+        );
+        for (command, method) in [
+            (
+                Command::ResizeLayer {
+                    session: session_id,
+                    layer: "layer:b".into(),
+                    bounds,
+                },
+                "session.resize_layer",
+            ),
+            (
+                Command::RaiseLayer {
+                    session: session_id,
+                    layer: "layer:b".into(),
+                },
+                "session.raise_layer",
+            ),
+            (
+                Command::LowerLayer {
+                    session: session_id,
+                    layer: "layer:b".into(),
+                },
+                "session.lower_layer",
+            ),
+            (
+                Command::CloseLayer {
+                    session: session_id,
+                    layer: "layer:b".into(),
+                },
+                "session.close_layer",
+            ),
+        ] {
+            let call = state.command(&command)?.context("layer call")?;
+            assert_eq!(call.method, method);
+            assert_eq!(call.params["session_id"], "session:a");
+            assert_eq!(call.params["layer_id"], "layer:b");
+        }
+        for layer in ["layer:a", "layer:unknown"] {
+            assert!(
+                state
+                    .command(&Command::CloseLayer {
+                        session: session_id,
+                        layer: layer.into()
+                    })
+                    .is_err()
+            );
+        }
+        for bounds in [
+            [-0.1, 0.0, 0.5, 0.5],
+            [0.0, 0.0, 0.0, 0.5],
+            [0.8, 0.0, 0.3, 0.5],
+            [0.0, 0.8, 0.5, 0.3],
+            [0.0, 0.0, f64::NAN, 0.5],
+        ] {
+            assert!(
+                state
+                    .command(&Command::ResizeLayer {
+                        session: session_id,
+                        layer: "layer:b".into(),
+                        bounds
+                    })
+                    .is_err()
+            );
+        }
+        assert!(
+            state
+                .command(&Command::ResizeLayer {
+                    session: session_id,
+                    layer: "layer:b".into(),
+                    bounds: [0.0, 0.0, 1.0, 1.0]
+                })
+                .is_ok()
         );
         Ok(())
     }

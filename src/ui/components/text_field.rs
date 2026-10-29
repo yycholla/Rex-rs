@@ -105,6 +105,7 @@ impl TextField {
         cx: &mut Context<Self>,
     ) {
         let event = KeyDownEvent {
+            native_key: None,
             keystroke: gpui::Keystroke {
                 key: input.key.clone(),
                 key_char: input.text.clone(),

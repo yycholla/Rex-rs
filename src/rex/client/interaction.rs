@@ -27,6 +27,12 @@ pub(super) enum LocalOperation {
     Search(SearchCommand),
     Select(SelectionCommand),
     Copy(ActionSender),
+    Link {
+        column: u16,
+        row: u16,
+        viewport_token: u64,
+        completion: ActionSender,
+    },
 }
 
 impl WorkspaceClient {
@@ -137,6 +143,52 @@ impl WorkspaceClient {
         self.enqueue(Operation::Local(pane, LocalOperation::Select(command)))
     }
 
+    /// Execute a server callback's local copy while its originating Lua request
+    /// waits. This separate lane never admits terminal input or server mutations.
+    ///
+    /// # Errors
+    /// Rejects unavailable replicas and full callback queues.
+    pub fn copy_callback_selection(&mut self, pane: PaneId) -> Result<ActionFuture> {
+        self.check_local_replica(pane)?;
+        let (sender, future) = automation::completion();
+        let mut mailbox = self.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
+        ensure!(
+            mailbox.callback_local.len() < 8,
+            "Local callback queue is full"
+        );
+        mailbox.callback_local.push_back(QueuedOperation {
+            instance: self.cache.state.instance_id().to_owned(),
+            generation: self.cache.connection_generation,
+            operation: Operation::Local(pane, LocalOperation::Copy(sender)),
+        });
+        Ok(future)
+    }
+
+    /// Resolve a user-activated OSC 8 hyperlink without process input.
+    ///
+    /// # Errors
+    /// Rejects unavailable replicas and full queues; stale positions fail asynchronously.
+    pub fn hyperlink_at(
+        &mut self,
+        pane: PaneId,
+        column: u16,
+        row: u16,
+        viewport_token: u64,
+    ) -> Result<ActionFuture> {
+        self.check_local_replica(pane)?;
+        let (completion, future) = automation::completion();
+        self.enqueue(Operation::Local(
+            pane,
+            LocalOperation::Link {
+                column,
+                row,
+                viewport_token,
+                completion,
+            },
+        ))?;
+        Ok(future)
+    }
+
     /// Format the native selection asynchronously, preserving logical soft wraps.
     ///
     /// # Errors
@@ -176,6 +228,23 @@ pub(super) fn execute(
     if let Some(stream) = streams.get_mut(&pane) {
         stream.set_interaction_visible(super::visible_panes(&cache.state).contains(&pane));
     }
+    if let LocalOperation::Link {
+        column,
+        row,
+        viewport_token,
+        completion,
+    } = operation
+    {
+        if !completion.is_cancelled() {
+            let result = streams
+                .get_mut(&pane)
+                .context("Local terminal history is unavailable")
+                .and_then(|stream| stream.hyperlink_at(column, row, viewport_token))
+                .map(|uri| json!({"uri":uri}));
+            completion.send(result);
+        }
+        return;
+    }
     if let LocalOperation::Copy(completion) = operation {
         if completion.is_cancelled() {
             return;
@@ -198,7 +267,7 @@ pub(super) fn execute(
             .get_mut(&pane)
             .context("Local terminal history is unavailable")
             .and_then(|stream| stream.select(command)),
-        LocalOperation::Copy(_) => return,
+        LocalOperation::Copy(_) | LocalOperation::Link { .. } => return,
     };
     if let Err(error) = result {
         record_error(mailbox, format!("Local terminal interaction: {error:#}"));

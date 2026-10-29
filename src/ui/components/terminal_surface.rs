@@ -1,12 +1,16 @@
 //! Retained terminal text: one canvas, no per-row or per-span layout elements.
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use crate::{
-    core::frame::{Cell, CellWidth, CursorStyle, Rgb, TerminalFrame, TerminalRow, UnderlineKind},
+    core::frame::{
+        Cell, CellWidth, CursorStyle, ImageLayer, Rgb, TerminalFrame, TerminalRow, UnderlineKind,
+    },
     ui::theme::{TerminalMetrics, Theme},
 };
 use gpui::{
@@ -15,6 +19,7 @@ use gpui::{
 };
 
 mod fallback;
+mod images;
 mod paint;
 use paint::{DecorationKind, DecorationSpan, append_decoration, paint_cursor, paint_decorations};
 
@@ -126,6 +131,7 @@ pub struct TerminalSurfaceStats {
 /// Font/geometry changes invalidate all shaped rows.
 #[derive(Clone)]
 pub struct TerminalSurfaceCache {
+    images: Rc<RefCell<images::ImageCache>>,
     rows: Vec<CachedRow>,
     prepared: Arc<Vec<Arc<PreparedRow>>>,
     metrics: Option<MetricsKey>,
@@ -139,6 +145,7 @@ pub struct TerminalSurfaceCache {
 impl Default for TerminalSurfaceCache {
     fn default() -> Self {
         Self {
+            images: Rc::default(),
             rows: Vec::new(),
             prepared: Arc::new(Vec::new()),
             metrics: None,
@@ -148,6 +155,12 @@ impl Default for TerminalSurfaceCache {
             last_report: None,
             missing_glyph: fallback::MissingGlyphOracle::default(),
         }
+    }
+}
+
+impl TerminalSurfaceCache {
+    pub(crate) fn release_images(&mut self, window: &mut Window) {
+        self.images.borrow_mut().clear(window);
     }
 }
 
@@ -824,9 +837,10 @@ pub fn terminal_surface(
     focused: bool,
     phase: TerminalPaintPhase,
     theme: Theme,
-    _window: &mut Window,
+    window: &mut Window,
 ) -> impl IntoElement + use<> {
     let metrics = theme.terminal;
+    let images = cache.images.borrow_mut().prepare(frame, window, metrics);
     let profile_paint = cache.profiling && cache.report_due();
     let rows = Arc::clone(&cache.prepared);
     if profile_paint {
@@ -841,10 +855,40 @@ pub fn terminal_surface(
             let started = profile_paint.then(Instant::now);
             let mut painted = PaintStats::default();
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                if profile_paint {
-                    painted = paint_rows::<true>(&rows, bounds, metrics, phase, window);
+                if images.is_empty() {
+                    if profile_paint {
+                        painted = paint_rows::<true, true>(&rows, bounds, metrics, phase, window);
+                    } else {
+                        paint_rows::<false, true>(&rows, bounds, metrics, phase, window);
+                    }
                 } else {
-                    paint_rows::<false>(&rows, bounds, metrics, phase, window);
+                    images::paint(
+                        &images,
+                        ImageLayer::BelowBackground,
+                        bounds.origin,
+                        metrics,
+                        window,
+                    );
+                    paint_grid_backgrounds(&rows, bounds, metrics, window);
+                    images::paint(
+                        &images,
+                        ImageLayer::BelowText,
+                        bounds.origin,
+                        metrics,
+                        window,
+                    );
+                    if profile_paint {
+                        painted = paint_rows::<true, false>(&rows, bounds, metrics, phase, window);
+                    } else {
+                        paint_rows::<false, false>(&rows, bounds, metrics, phase, window);
+                    }
+                    images::paint(
+                        &images,
+                        ImageLayer::AboveText,
+                        bounds.origin,
+                        metrics,
+                        window,
+                    );
                 }
                 if let Some(cursor) = &cursor {
                     paint_cursor(cursor, &rows, bounds.origin, metrics, phase, window);
@@ -873,7 +917,7 @@ struct PaintStats {
     culled: usize,
 }
 
-fn paint_rows<const PROFILE: bool>(
+fn paint_rows<const PROFILE: bool, const BACKGROUNDS: bool>(
     rows: &[Arc<PreparedRow>],
     bounds: Bounds<Pixels>,
     metrics: TerminalMetrics,
@@ -891,7 +935,8 @@ fn paint_rows<const PROFILE: bool>(
             let origin = point(bounds.origin.x, top);
             let row_bounds = Bounds::new(origin, size(bounds.size.width, px(metrics.cell_height)));
             window.with_content_mask(Some(ContentMask { bounds: row_bounds }), |window| {
-                let culled = paint_row::<PROFILE>(row, row_bounds, metrics, phase, window);
+                let culled =
+                    paint_row::<PROFILE, BACKGROUNDS>(row, row_bounds, metrics, phase, window);
                 if PROFILE {
                     stats.rows += 1;
                     stats.glyphs += row.glyphs.len() - culled;
@@ -904,7 +949,7 @@ fn paint_rows<const PROFILE: bool>(
     stats
 }
 
-fn paint_row<const PROFILE: bool>(
+fn paint_row<const PROFILE: bool, const BACKGROUNDS: bool>(
     row: &PreparedRow,
     bounds: Bounds<Pixels>,
     metrics: TerminalMetrics,
@@ -915,7 +960,7 @@ fn paint_row<const PROFILE: bool>(
     // layer, every raw glyph enters the scene's spatial ordering tree, even
     // though terminal rows already have disjoint content masks. Keep separate
     // passes so backgrounds, text and underlines retain their draw order.
-    if !row.backgrounds.is_empty() {
+    if BACKGROUNDS && !row.backgrounds.is_empty() {
         window.paint_layer(bounds, |window| {
             paint_backgrounds(row, bounds.origin, metrics, window);
         });
@@ -933,6 +978,24 @@ fn paint_row<const PROFILE: bool>(
         });
     }
     culled
+}
+
+fn paint_grid_backgrounds(
+    rows: &[Arc<PreparedRow>],
+    bounds: Bounds<Pixels>,
+    metrics: TerminalMetrics,
+    window: &mut Window,
+) {
+    let mut origin = bounds.origin;
+    for row in rows {
+        let row_bounds = Bounds::new(origin, size(bounds.size.width, px(metrics.cell_height)));
+        if row_bounds.intersects(&window.content_mask().bounds) {
+            window.paint_layer(row_bounds, |window| {
+                paint_backgrounds(row, origin, metrics, window);
+            });
+        }
+        origin.y += px(metrics.cell_height);
+    }
 }
 
 fn paint_backgrounds(
@@ -1070,6 +1133,8 @@ mod tests {
     )]
     fn cache_frame() -> TerminalFrame {
         TerminalFrame {
+            images: Arc::default(),
+            graphics_warning: None,
             size: GridSize::new(3, 2).unwrap(),
             rows: vec![
                 Arc::new(vec![cell("a", 1), cell("b", 1), cell("c", 1)]),

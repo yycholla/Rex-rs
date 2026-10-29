@@ -1,8 +1,11 @@
 mod automation;
 mod detached;
 mod find;
+mod floating;
+mod links;
 mod management;
 mod overview;
+mod palette;
 mod shortcuts;
 
 use std::{
@@ -75,19 +78,29 @@ struct RenameDialog {
     _blur: Subscription,
 }
 
+/// Presentation ownership is independent of the retained server connection.
+struct PresentationState {
+    visible: bool,
+    generation: u64,
+}
+
 pub struct WorkspaceView {
     runtime: WorkspaceClient,
+    presentation: PresentationState,
     panes: BTreeMap<PaneId, PaneView>,
     theme: Theme,
     focus: FocusHandle,
     last_error: Option<String>,
     split_bounds: BTreeMap<SplitId, Bounds<Pixels>>,
     split_drag: Option<SplitDrag>,
+    layer_drag: Option<floating::LayerDrag>,
+    floating_bounds: Option<Bounds<Pixels>>,
     focus_pending: bool,
     rename: Option<RenameDialog>,
     arranging: Option<PaneId>,
     detached_browser: Option<SessionId>,
     find: Option<find::FindState>,
+    palette: Option<palette::PaletteState>,
     search_counter: u64,
     /// Session whose overview replaces the terminals while it stays active.
     overview: Option<SessionId>,
@@ -96,10 +109,13 @@ pub struct WorkspaceView {
     insights_task: Option<Task<()>>,
     _polling: Task<()>,
     window_handle: Option<AnyWindowHandle>,
+    activation: Option<Subscription>,
     client_actions: VecDeque<crate::rex::automation::ClientActionRequest>,
     action_running: bool,
     action_task: Option<Task<()>>,
     sidebar_visible: bool,
+    /// The host's label for this server while its sidebar renders the tree.
+    embedded: Option<SharedString>,
     shortcuts: shortcuts::Shortcuts,
     initial_scripts: Option<Vec<crate::rex::ClientScript>>,
 }
@@ -114,9 +130,29 @@ impl WorkspaceView {
         scripts: Vec<crate::rex::ClientScript>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let theme = Theme::default();
-        // Attachment is asynchronous and never creates sessions or launches shells.
         let runtime = endpoint.map_or_else(WorkspaceClient::new, WorkspaceClient::connect);
+        Self::with_runtime(runtime, scripts, cx)
+    }
+
+    pub fn new_with_server(
+        endpoint: String,
+        scripts: Vec<crate::rex::ClientScript>,
+        server: crate::rex::servers::NamedServer,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_runtime(
+            WorkspaceClient::connect_named(endpoint, server),
+            scripts,
+            cx,
+        )
+    }
+
+    fn with_runtime(
+        runtime: WorkspaceClient,
+        scripts: Vec<crate::rex::ClientScript>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let theme = Theme::default();
         let polling = cx.spawn(async move |this, cx| {
             loop {
                 let Ok(update) = this.update(cx, |view, _| view.runtime.wait_for_update()) else {
@@ -130,32 +166,170 @@ impl WorkspaceView {
         });
         let mut view = Self {
             runtime,
+            presentation: PresentationState {
+                visible: true,
+                generation: 0,
+            },
             panes: BTreeMap::new(),
             theme,
             focus: cx.focus_handle(),
             last_error: None,
             split_bounds: BTreeMap::new(),
             split_drag: None,
+            layer_drag: None,
+            floating_bounds: None,
             focus_pending: false,
             rename: None,
             arranging: None,
             detached_browser: None,
             find: None,
+            palette: None,
             search_counter: 0,
             overview: None,
             insights: None,
             insights_task: None,
             _polling: polling,
             window_handle: None,
+            activation: None,
             client_actions: VecDeque::new(),
             action_running: false,
             action_task: None,
             sidebar_visible: true,
+            embedded: None,
             shortcuts: shortcuts::Shortcuts::default(),
             initial_scripts: (!scripts.is_empty()).then_some(scripts),
         };
         view.sync_views(true, cx);
         view
+    }
+
+    /// Bind every child, including those not yet rendered, so callbacks receive replies.
+    pub fn bind_host_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_handle = Some(window.window_handle());
+        self.observe_activation(window, cx);
+        self.schedule_client_actions(cx);
+    }
+
+    #[must_use]
+    pub fn connected(&self) -> bool {
+        self.runtime.connected()
+    }
+
+    /// The latest error, which while disconnected explains the failed connection.
+    #[must_use]
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// A transient notice the host's footer shows for the presented server:
+    /// an error (`true`) or the active key mode.
+    #[must_use]
+    pub fn status_notice(&self) -> Option<(String, bool)> {
+        if let Some(error) = &self.last_error {
+            return Some((error.clone(), true));
+        }
+        self.shortcuts
+            .active_mode()
+            .map(|mode| (format!("Key mode: {mode} · Escape to leave"), false))
+    }
+
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.runtime.state().sessions().len()
+    }
+
+    /// Lets a host render this server's sessions in its own sidebar.
+    pub fn set_embedded(&mut self, label: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.embedded != label {
+            self.embedded = label;
+            cx.notify();
+        }
+    }
+
+    #[must_use]
+    pub const fn sidebar_visible(&self) -> bool {
+        self.sidebar_visible
+    }
+
+    pub fn set_sidebar_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.sidebar_visible != visible {
+            self.sidebar_visible = visible;
+            cx.notify();
+        }
+    }
+
+    pub fn request_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_session(&NewSession, window, cx);
+    }
+
+    /// Retain the server connection while excluding this workspace from presentation.
+    pub fn set_presented(&mut self, presented: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.bind_host_window(window, cx);
+        if self.presentation.visible == presented {
+            return;
+        }
+        self.presentation.visible = presented;
+        self.presentation.generation = self.presentation.generation.wrapping_add(1);
+        if !presented {
+            self.split_drag = None;
+            self.layer_drag = None;
+            self.clear_queued_shortcuts();
+            if self.focus.contains_focused(window, cx) {
+                window.blur();
+            }
+        }
+        self.focus_pending = presented;
+        self.sync_presentation_visibility(cx);
+        cx.notify();
+    }
+
+    /// Restore the current editor or terminal after selecting this server.
+    pub fn focus_presented(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.presentation.visible {
+            return;
+        }
+        if let Some(dialog) = &self.rename {
+            dialog.input.focus_handle(cx).focus(window);
+        } else if let Some(focus) = self.palette_focus(cx) {
+            focus.focus(window);
+        } else if self.arranging.is_some() || self.detached_browser.is_some() {
+            self.focus.focus(window);
+        } else {
+            self.focus_active(window, cx);
+        }
+    }
+
+    fn observe_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.activation.is_none() {
+            self.activation = Some(cx.observe_window_activation(window, |view, window, cx| {
+                if !window.is_window_active() {
+                    view.layer_drag = None;
+                    view.split_drag = None;
+                    cx.notify();
+                }
+            }));
+        }
+    }
+
+    fn sync_split_bounds(&mut self) {
+        let mut splits = BTreeSet::new();
+        for session in self.runtime.state().sessions() {
+            for tab in session.windows() {
+                for layer in &tab.layers {
+                    if let Some(layout) = &layer.layout {
+                        collect_split_ids(layout, &mut splits);
+                    }
+                }
+            }
+        }
+        self.split_bounds.retain(|id, _| splits.contains(id));
+        if self
+            .split_drag
+            .as_ref()
+            .is_some_and(|drag| !splits.contains(&drag.split))
+        {
+            self.split_drag = None;
+        }
     }
 
     /// Reconcile runtime frames without invalidating workspace chrome for output.
@@ -165,22 +339,7 @@ impl WorkspaceView {
         let active_pane = self.active_pane();
         let connected = self.runtime.connected();
         if layout_changed {
-            let mut splits = BTreeSet::new();
-            for session in self.runtime.state().sessions() {
-                for tab in session.windows() {
-                    if let Some(layout) = tab.layout() {
-                        collect_split_ids(layout, &mut splits);
-                    }
-                }
-            }
-            self.split_bounds.retain(|id, _| splits.contains(id));
-            if self
-                .split_drag
-                .as_ref()
-                .is_some_and(|drag| !splits.contains(&drag.split))
-            {
-                self.split_drag = None;
-            }
+            self.sync_split_bounds();
         }
         let previous_count = self.panes.len();
         self.panes
@@ -268,6 +427,16 @@ impl WorkspaceView {
         let previous_server = self.runtime.server_id().map(str::to_owned);
         let was_connected = self.runtime.connected();
         let result = self.runtime.poll();
+        let clipboard = self.runtime.take_program_clipboard();
+        if self.presentation.visible
+            && cx.active_window() == self.window_handle
+            && self.window_handle.is_some()
+            && !self.has_modal()
+        {
+            for text in clipboard {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            }
+        }
         self.reconcile_find(cx);
         self.client_actions
             .extend(self.runtime.take_client_actions());
@@ -327,6 +496,8 @@ impl WorkspaceView {
             // selection, composition or zoom into a different terminal lifetime.
             self.panes.clear();
             self.split_bounds.clear();
+            self.layer_drag = None;
+            self.floating_bounds = None;
             self.split_drag = None;
             self.rename = None;
             self.arranging = None;
@@ -353,6 +524,7 @@ impl WorkspaceView {
                 self.set_error(format!("{error:#}"), cx);
             }
         }
+        self.sync_presentation_visibility(cx);
     }
 
     fn report_error(&mut self, message: String, cx: &mut Context<Self>) {
@@ -370,16 +542,23 @@ impl WorkspaceView {
     }
 
     fn terminal_event(&mut self, pane: PaneId, event: &TerminalViewEvent, cx: &mut Context<Self>) {
+        if !self.presentation.visible && !inactive_cleanup_event(event) {
+            return;
+        }
         if !self.runtime.connected()
             || self.runtime.state().pane(pane).is_none()
             || self.runtime.state().is_detached(pane)
         {
             return;
         }
-        if (self.arranging.is_some() || self.detached_browser.is_some())
+        if self.presentation.visible
+            && (self.arranging.is_some()
+                || self.detached_browser.is_some()
+                || self.palette.is_some())
             && matches!(
                 event,
-                TerminalViewEvent::Key(_)
+                TerminalViewEvent::OpenLink { .. }
+                    | TerminalViewEvent::Key(_)
                     | TerminalViewEvent::Text(_)
                     | TerminalViewEvent::Mouse(_)
                     | TerminalViewEvent::Wheel { .. }
@@ -391,7 +570,7 @@ impl WorkspaceView {
         {
             return;
         }
-        if self.defer_terminal_input(pane, event, cx) {
+        if self.presentation.visible && self.defer_terminal_input(pane, event, cx) {
             return;
         }
         let restore_size = matches!(
@@ -411,6 +590,14 @@ impl WorkspaceView {
             return;
         }
         let result = match event {
+            TerminalViewEvent::OpenLink {
+                column,
+                row,
+                viewport_token,
+            } => {
+                self.open_terminal_link(pane, *column, *row, *viewport_token, cx);
+                Ok(())
+            }
             TerminalViewEvent::Focused => self.runtime.apply(Command::FocusPane(pane)),
             TerminalViewEvent::Interacted => Ok(()),
             TerminalViewEvent::FocusChanged(focused) => self.runtime.focus(pane, *focused),
@@ -464,6 +651,9 @@ impl WorkspaceView {
     }
 
     fn dispatch(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.presentation.visible {
+            return;
+        }
         self.overview = None;
         if self.defer_command(&command, cx) {
             return;
@@ -477,7 +667,7 @@ impl WorkspaceView {
     }
 
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.has_modal() {
+        if !self.presentation.visible || self.has_modal() {
             return;
         }
         if let Some(focus) = self.find_focus(cx) {
@@ -498,10 +688,8 @@ impl WorkspaceView {
         if let Some(zoomed) = tab.zoomed_pane() {
             return Some(zoomed);
         }
-        tab.active_pane().filter(|pane| {
-            tab.layout()
-                .is_some_and(|layout| layout.panes().contains(pane))
-        })
+        tab.active_pane()
+            .filter(|pane| tab.visible_panes().contains(pane))
     }
 
     fn new_session(&mut self, _: &NewSession, window: &mut Window, cx: &mut Context<Self>) {
@@ -669,6 +857,10 @@ impl WorkspaceView {
         cx.notify();
     }
     fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Switching servers hides the editor without accepting unfinished text.
+        if !self.presentation.visible {
+            return;
+        }
         let Some(dialog) = &self.rename else {
             return;
         };
@@ -866,13 +1058,16 @@ impl WorkspaceView {
                 self.sidebar_tab(
                     session,
                     tab,
-                    is_active && self.overview != Some(id) && Some(tab.id()) == selected_window,
+                    is_active
+                        && self.presentation.visible
+                        && self.overview != Some(id)
+                        && Some(tab.id()) == selected_window,
                     cx,
                 )
                 .into_any_element(),
             );
         }
-        if is_active {
+        if is_active && self.presentation.visible {
             rows.push(
                 add_row(
                     SharedString::from(format!("new-window-{id}")),
@@ -894,10 +1089,38 @@ impl WorkspaceView {
         rows
     }
 
-    fn sidebar(&self, cx: &Context<Self>) -> Div {
-        let theme = self.theme;
+    /// Every session with its tabs, separated by small gaps.
+    fn session_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         let state = self.runtime.state();
         let active = state.active_session().map(Session::id);
+        let mut rows = Vec::new();
+        for (index, session) in state.sessions().iter().enumerate() {
+            if index > 0 {
+                rows.push(div().flex_none().h(px(6.)).into_any_element());
+            }
+            rows.extend(self.sidebar_session(session, active == Some(session.id()), cx));
+        }
+        rows
+    }
+
+    fn new_session_row(&self, cx: &Context<Self>) -> gpui::Stateful<Div> {
+        add_row("new-session-row", "New session", false, self.theme)
+            .on_click(cx.listener(|view, _, window, cx| view.new_session(&NewSession, window, cx)))
+    }
+
+    /// This server's sessions for a host sidebar. A server without sessions
+    /// offers to create one; otherwise the host's header provides that action.
+    #[must_use]
+    pub fn session_tree(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        let mut rows = self.session_rows(cx);
+        if rows.is_empty() {
+            rows.push(self.new_session_row(cx).pl(px(28.)).into_any_element());
+        }
+        rows
+    }
+
+    fn sidebar(&self, cx: &Context<Self>) -> Div {
+        let theme = self.theme;
         let mut list = div()
             .id("session-list")
             .flex()
@@ -919,17 +1142,10 @@ impl WorkspaceView {
                 },
                 theme,
             ));
-        for (index, session) in state.sessions().iter().enumerate() {
-            if index > 0 {
-                list = list.child(div().flex_none().h(px(6.)));
-            }
-            list = list.children(self.sidebar_session(session, active == Some(session.id()), cx));
-        }
-        list = list.child(div().flex_none().h(px(6.))).child(
-            add_row("new-session-row", "New session", false, theme).on_click(
-                cx.listener(|view, _, window, cx| view.new_session(&NewSession, window, cx)),
-            ),
-        );
+        list = list
+            .children(self.session_rows(cx))
+            .child(div().flex_none().h(px(6.)))
+            .child(self.new_session_row(cx));
         let message = self.connection_message();
         div()
             .flex()
@@ -948,23 +1164,19 @@ impl WorkspaceView {
     }
 
     fn sync_presentation_visibility(&self, cx: &mut Context<Self>) {
-        let visible: BTreeSet<_> = if self.overview_session().is_some() {
-            BTreeSet::new()
-        } else {
-            self.runtime
-                .state()
-                .active_session()
-                .and_then(Session::active_window)
-                .map(|tab| {
-                    tab.zoomed_pane().map_or_else(
-                        || tab.layout().map(Layout::panes).unwrap_or_default(),
-                        |pane| vec![pane],
-                    )
-                })
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
-        };
+        let visible: BTreeSet<_> =
+            if !self.presentation.visible || self.overview_session().is_some() {
+                BTreeSet::new()
+            } else {
+                self.runtime
+                    .state()
+                    .active_session()
+                    .and_then(Session::active_window)
+                    .map(WindowView::visible_panes)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect()
+            };
         for (pane, entry) in &self.panes {
             entry.view.update(cx, |view, cx| {
                 view.set_animation_enabled(
@@ -992,18 +1204,7 @@ impl WorkspaceView {
                     .iter()
                     .filter_map(|layer| layer.unsupported.as_deref())
                     .collect();
-                let body = if let Some(pane) = tab.zoomed_pane() {
-                    self.pane(pane, true, false, cx)
-                } else if let Some(layout) = tab.layout() {
-                    self.layout(layout, self.active_pane(), layout.panes().len() > 1, cx)
-                } else {
-                    empty_state(
-                        "Unsupported layout",
-                        "This tab has no supported tiled terminal layout.",
-                        theme,
-                    )
-                    .into_any_element()
-                };
+                let body = self.layered_window(tab, cx);
                 div()
                     .flex()
                     .flex_col()
@@ -1100,11 +1301,20 @@ impl WorkspaceView {
             )
             .child(
                 icon_button("new-session", Icon::Plus, theme)
+                    // Keep the titlebar's window move from swallowing the click.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .tooltip(tooltip("New session", theme))
                     .on_click(cx.listener(|view, _, window, cx| {
                         view.new_session(&NewSession, window, cx);
                     })),
             )
+    }
+
+    /// "Server / session" for the focused pane while a host lists several servers.
+    fn breadcrumb(&self) -> Option<String> {
+        let server = self.embedded.as_ref()?;
+        let session = self.runtime.state().active_session()?;
+        Some(format!("{server} / {}", session.title()))
     }
 
     fn pane(&self, pane: PaneId, focused: bool, multiple: bool, cx: &Context<Self>) -> AnyElement {
@@ -1130,6 +1340,17 @@ impl WorkspaceView {
             theme,
         )
         .rounded_t(px(theme.pane_radius - 1.))
+        .when_some(self.breadcrumb().filter(|_| focused), |header, crumb| {
+            header.child(
+                div()
+                    .flex_none()
+                    .max_w(px(220.))
+                    .truncate()
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(rgb(colors.faint))
+                    .child(crumb),
+            )
+        })
         .when_some(status, |header, status| {
             header.child(
                 div()
@@ -1185,6 +1406,43 @@ impl WorkspaceView {
             .into_any_element()
     }
 
+    fn can_float(&self, pane: PaneId) -> bool {
+        self.runtime.connected()
+            && self
+                .runtime
+                .state()
+                .command(&Command::FloatPane {
+                    pane,
+                    bounds: [0.1, 0.1, 0.8, 0.8],
+                })
+                .is_ok()
+    }
+
+    fn ownership_button(&self, pane: PaneId, cx: &Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let colors = theme.colors;
+        let own = self.runtime.owns_size(pane);
+        tinted_icon_button(
+            SharedString::from(format!("terminal-control-{pane}")),
+            Icon::Lock,
+            if own { colors.accent } else { colors.faint },
+            theme,
+        )
+        .tooltip(tooltip(
+            if own {
+                "Release size ownership"
+            } else {
+                "Take size ownership"
+            },
+            theme,
+        ))
+        .on_click(cx.listener(move |view, _, _, cx| {
+            if let Err(error) = view.runtime.set_size_ownership(pane, !own) {
+                view.report_error(format!("{error:#}"), cx);
+            }
+        }))
+    }
+
     /// Trailing pane-header controls. They act on their own pane, not the focused
     /// one, and stay hidden on unfocused panes until the pointer is over them.
     fn pane_controls(
@@ -1197,7 +1455,6 @@ impl WorkspaceView {
         cx: &Context<Self>,
     ) -> Div {
         let theme = self.theme;
-        let colors = theme.colors;
         let control = |name: &str, glyph: Icon, label: &'static str| {
             icon_button(SharedString::from(format!("{name}-{pane}")), glyph, theme)
                 .tooltip(tooltip(label, theme))
@@ -1207,7 +1464,6 @@ impl WorkspaceView {
                 view.dispatch(Command::SplitPane { pane, axis }, window, cx);
             }))
         };
-        let own = self.runtime.owns_size(pane);
         let controls = div()
             .flex()
             .flex_none()
@@ -1220,27 +1476,7 @@ impl WorkspaceView {
             })
             .when(self.runtime.connected(), |controls| {
                 controls
-                    .child(
-                        tinted_icon_button(
-                            SharedString::from(format!("terminal-control-{pane}")),
-                            Icon::Lock,
-                            if own { colors.accent } else { colors.faint },
-                            theme,
-                        )
-                        .tooltip(tooltip(
-                            if own {
-                                "Release size ownership"
-                            } else {
-                                "Take size ownership"
-                            },
-                            theme,
-                        ))
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            if let Err(error) = view.runtime.set_size_ownership(pane, !own) {
-                                view.report_error(format!("{error:#}"), cx);
-                            }
-                        })),
-                    )
+                    .child(self.ownership_button(pane, cx))
                     .child(control_separator(theme))
             })
             .child(split(
@@ -1262,6 +1498,20 @@ impl WorkspaceView {
                     },
                 )),
             )
+            .when(self.can_float(pane), |controls| {
+                controls.child(control("float", Icon::Maximize, "Float pane").on_click(
+                    cx.listener(move |view, _, window, cx| {
+                        view.submit_command(
+                            Command::FloatPane {
+                                pane,
+                                bounds: [0.1, 0.1, 0.8, 0.8],
+                            },
+                            window,
+                            cx,
+                        );
+                    }),
+                ))
+            })
             .child(
                 control("detach", Icon::Detach, "Detach").on_click(cx.listener(
                     move |view, _, window, cx| {
@@ -1296,13 +1546,15 @@ impl WorkspaceView {
         header.child(controls)
     }
 
-    fn resize_drag(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn resize_drag(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_layer_drag(event, window, cx);
         if event.dragging() {
             self.resize_to(event.position, false, cx);
         }
     }
 
-    fn finish_resize(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn finish_resize(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_layer_drag(event, window, cx);
         self.resize_to(event.position, true, cx);
         self.split_drag = None;
     }
@@ -1524,25 +1776,27 @@ fn ratio_at(bounds: Bounds<Pixels>, axis: SplitAxis, position: gpui::Point<Pixel
 
 impl Focusable for WorkspaceView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.find_focus(cx).unwrap_or_else(|| {
-            self.active_pane()
-                .and_then(|pane| self.panes.get(&pane))
-                .map_or_else(|| self.focus.clone(), |entry| entry.view.focus_handle(cx))
-        })
+        self.rename
+            .as_ref()
+            .map(|dialog| dialog.input.focus_handle(cx))
+            .or_else(|| self.palette_focus(cx))
+            .or_else(|| self.find_focus(cx))
+            .unwrap_or_else(|| {
+                self.active_pane()
+                    .and_then(|pane| self.panes.get(&pane))
+                    .map_or_else(|| self.focus.clone(), |entry| entry.view.focus_handle(cx))
+            })
     }
 }
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.window_handle = Some(window.window_handle());
-        self.schedule_client_actions(cx);
+        self.bind_host_window(window, cx);
         self.schedule_insights(cx);
-        if self.focus_pending && !self.has_modal() {
+        if self.presentation.visible && self.focus_pending {
             self.focus_pending = false;
             cx.defer_in(window, |view, window, cx| {
-                if !view.has_modal() {
-                    view.focus_active(window, cx);
-                }
+                view.focus_presented(window, cx);
             });
         }
         self.sync_presentation_visibility(cx);
@@ -1586,7 +1840,9 @@ impl Render for WorkspaceView {
             .on_mouse_move(cx.listener(Self::resize_drag))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_resize))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_resize))
-            .when(self.sidebar_visible, |root| root.child(self.sidebar(cx)))
+            .when(self.sidebar_visible && self.embedded.is_none(), |root| {
+                root.child(self.sidebar(cx))
+            })
             .child(
                 div()
                     .flex()
@@ -1628,13 +1884,69 @@ impl Render for WorkspaceView {
         if let Some(session) = self.detached_browser {
             root = root.child(self.detached_dialog(session, cx));
         }
+        if self.palette.is_some() {
+            root = root.child(self.palette_dialog(cx));
+        }
         root
     }
+}
+
+/// Cleanup must reach its original server after the user switches away.
+fn inactive_cleanup_event(event: &TerminalViewEvent) -> bool {
+    matches!(event, TerminalViewEvent::FocusChanged(false))
+        || matches!(event, TerminalViewEvent::Mouse(input) if input.action == MouseAction::Release)
+        || matches!(
+            event,
+            TerminalViewEvent::Selection(
+                crate::core::interaction::SelectionCommand::Release
+                    | crate::core::interaction::SelectionCommand::Cancel
+            )
+        )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_workspaces_allow_cleanup_but_reject_new_input() {
+        use crate::core::{
+            input::{Modifiers, MouseButton, MouseInput},
+            interaction::SelectionCommand,
+        };
+        assert!(inactive_cleanup_event(&TerminalViewEvent::FocusChanged(
+            false
+        )));
+        assert!(!inactive_cleanup_event(&TerminalViewEvent::FocusChanged(
+            true
+        )));
+        assert!(inactive_cleanup_event(&TerminalViewEvent::Selection(
+            SelectionCommand::Release
+        )));
+        assert!(inactive_cleanup_event(&TerminalViewEvent::Selection(
+            SelectionCommand::Cancel
+        )));
+        for action in [MouseAction::Press, MouseAction::Move, MouseAction::Release] {
+            assert_eq!(
+                inactive_cleanup_event(&TerminalViewEvent::Mouse(MouseInput {
+                    action,
+                    button: MouseButton::Left,
+                    column: 2,
+                    row: 3,
+                    modifiers: Modifiers::default(),
+                })),
+                action == MouseAction::Release
+            );
+        }
+        for event in [
+            TerminalViewEvent::Focused,
+            TerminalViewEvent::Interacted,
+            TerminalViewEvent::Text("wrong server".into()),
+            TerminalViewEvent::Scroll(1),
+        ] {
+            assert!(!inactive_cleanup_event(&event));
+        }
+    }
 
     #[test]
     fn viewport_handoff_coalesces_input_but_retries_and_accepts_new_local_size()

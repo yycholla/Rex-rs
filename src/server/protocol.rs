@@ -245,6 +245,8 @@ mod tests {
             .unwrap();
         let pane = state.pane_ids()[0];
         let frame = TerminalFrame {
+            images: Arc::default(),
+            graphics_warning: None,
             size: GridSize::new(1, 1).unwrap(),
             rows: vec![Arc::new(vec![Cell::default()])],
             cursor: None,
