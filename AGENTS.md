@@ -2,14 +2,24 @@
 
 Build a Linux terminal workspace in Rust with GPUI and libghostty-vt.
 Read [README.md](README.md) and [docs/architecture.md](docs/architecture.md) first.
-The current UI is a preview; PTYs and Rex server compatibility are not implemented.
+The desktop uses the official Rex server through `src/rex/`; it does not host
+processes or initialize sessions on attachment. Read docs/rex-server-migration.md,
+docs/rex-control-protocol.md and docs/rex-terminal-protocol.md for protocol and
+ownership details. The private local server remains a development fixture;
+docs/local-server.md describes that legacy path.
 
 ## Boundaries
 
 - `core/` is pure Rust state and owned data. No GPUI, Ghostty, IO, or async runtime.
+- `rex/terminal.rs` owns data streams and display-replica lifetimes;
+  `rex/client.rs` caches their owned frames by PaneId.
 - `terminal/ghostty.rs` owns all Ghostty FFI interaction. Its handles stay on their
   owning thread; never implement unsafe Send/Sync. Share owned frames instead.
-- `terminal/workspace.rs` owns terminal lifetimes and frame caches by PaneId.
+- `rex/client.rs` owns the bounded desktop cache/worker. Rex is authoritative for
+  layouts and processes; local display replicas never send device query replies.
+- `terminal/workspace.rs` owns legacy terminal lifetimes and frame caches by PaneId.
+  `terminal/pty.rs` owns bounded IO workers and process cleanup; never block the
+  UI thread on reads, writes, or child waits.
 - `ui/components/` contains composable presentation. Use semantic theme tokens;
   keep workspace mutations, shell IO and process management out of components.
 - Buttons and shortcuts dispatch the same core Commands. Preserve stable IDs.
@@ -26,6 +36,9 @@ disjoint. Agents should not revert or format another agent's in-progress files.
 
 | Workstream | Typical ownership |
 | --- | --- |
+| Rex control transport | `src/rex/transport.rs` and `src/rex/protocol.rs` |
+| Rex view adaptation | `src/rex/workspace.rs` |
+| Rex terminal streams | `src/rex/terminal.rs` |
 | Workspace behavior | `src/core/workspace.rs` and its tests |
 | Terminal backend/transport | `src/terminal/` and `src/bin/ghostty-smoke.rs` |
 | UI primitives | `src/ui/components/` and `src/ui/theme.rs` |
@@ -41,10 +54,11 @@ the combined result and runs the full checks after integrating.
 ## Checks
 
 - `mise run verify` is the integration gate: formatting, compilation, strict Clippy,
-  tests and Ghostty smoke checks, run sequentially to avoid Cargo lock contention.
+  tests, Ghostty smoke checks and isolated native Rex interoperability, run
+  sequentially to avoid Cargo lock contention. Native smoke requires `rex` on PATH.
 - `mise run test:core`: pure state/frame tests, no external crate downloads.
 - `mise run check`: formatting and compilation of all targets.
-- `mise run test`: unit tests and headless Ghostty smoke checks.
+- `mise run test`: unit tests and headless Ghostty/input/real-PTY smoke checks.
 - `mise run lint`: Clippy; `mise run dev`: manual desktop verification.
 - Keep Clippy `all` and `pedantic` enabled; lint warnings fail verification.
   Fix findings rather than weakening project settings. Any narrow allowance

@@ -6,15 +6,53 @@ rust-version = "1.90"
 publish = false
 default-run = "rex-rs"
 
+# GPUI's glyph/scene hot loops must stay optimized in the interactive dev app.
+[profile.dev.package.gpui]
+opt-level = 2
+
+# GPUI delegates Linux shaping and glyph rasterization to these crates. Cargo's
+# package optimization does not extend to dependencies; leaving them at level 0
+# makes a dense terminal spend multiple milliseconds shaping each changed row.
+[profile.dev.package.cosmic-text]
+opt-level = 2
+
+[profile.dev.package.rustybuzz]
+opt-level = 2
+
+[profile.dev.package.swash]
+opt-level = 2
+
+[profile.dev.package.ttf-parser]
+opt-level = 2
+
+# Keep symbols and runtime checks while optimizing the interactive hot paths.
+[profile.dev.package.rex-rs]
+opt-level = 1
+
+[profile.dev.package.serde_json]
+opt-level = 2
+
+[profile.dev.package.itoa]
+opt-level = 2
+
 [dependencies]
 anyhow = { version = "1", optional = true }
 gpui = { version = "=0.2.2", optional = true }
-libghostty-vt = { version = "=0.2.1", optional = true }
+# Rex terminal streams begin with a Ghostty snapshot; the released wrapper lacks
+# the decoder. Pin the snapshot-capable wrapper rather than following its branch.
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "9ede35b8ea94a55ed3608408d67e102883129f1e", optional = true }
+portable-pty = { version = "0.9", optional = true }
+nix = { version = "0.29", features = ["signal", "process", "user"], optional = true }
+unicode-segmentation = { version = "1", optional = true }
+
+serde = { version = "1", features = ["derive", "rc"], optional = true }
+serde_json = { version = "1", optional = true }
+tungstenite = { version = "0.28", optional = true }
 
 [features]
 default = ["desktop"]
-ghostty = ["dep:anyhow", "dep:libghostty-vt"]
-desktop = ["ghostty", "dep:gpui"]
+ghostty = ["dep:anyhow", "dep:libghostty-vt", "dep:portable-pty", "dep:nix", "dep:serde", "dep:serde_json", "dep:tungstenite"]
+desktop = ["ghostty", "dep:gpui", "dep:unicode-segmentation"]
 
 [[bin]]
 name = "rex-rs"
@@ -24,6 +62,51 @@ required-features = ["desktop"]
 [[bin]]
 name = "ghostty-smoke"
 path = "src/bin/ghostty-smoke.rs"
+required-features = ["ghostty"]
+
+[[bin]]
+name = "pty-smoke"
+path = "src/bin/pty-smoke.rs"
+required-features = ["ghostty"]
+
+[[bin]]
+name = "input-smoke"
+path = "src/bin/input-smoke.rs"
+required-features = ["ghostty"]
+
+[[bin]]
+name = "terminal-bench"
+path = "src/bin/terminal-bench.rs"
+required-features = ["ghostty"]
+
+[[bin]]
+name = "server-bench"
+path = "src/bin/server-bench.rs"
+required-features = ["ghostty"]
+
+[[bin]]
+name = "rex-server"
+path = "src/bin/rex-server.rs"
+required-features = ["ghostty"]
+
+[[bin]]
+name = "server-smoke"
+path = "src/bin/server-smoke.rs"
+required-features = ["ghostty"]
+
+[[bin]]
+name = "rexctl"
+path = "src/bin/rexctl.rs"
+required-features = ["ghostty"]
+
+[[bin]]
+name = "cli-smoke"
+path = "src/bin/cli-smoke.rs"
+required-features = ["ghostty"]
+
+[[bin]]
+name = "rex-native-smoke"
+path = "src/bin/rex-native-smoke.rs"
 required-features = ["ghostty"]
 
 [lints.rust]

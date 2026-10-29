@@ -1,6 +1,6 @@
 [tools]
 rust = "1.99.1"
-zig = "0.15.2"
+zig = "0.17.0"
 
 [tasks.check]
 description = "Check formatting and compile all targets"
@@ -15,8 +15,8 @@ description = "Run pure state and rendering-data tests without dependency downlo
 run = "bash scripts/test-core.sh"
 
 [tasks.test]
-description = "Run all unit tests and the Ghostty integration smoke executable"
-run = ["cargo test --locked --all-targets", "cargo run --locked --no-default-features --features ghostty --bin ghostty-smoke"]
+description = "Run unit tests and Ghostty, input-protocol, PTY, server and CLI smoke checks"
+run = ["cargo test --locked --all-targets", "cargo run --locked --no-default-features --features ghostty --bin ghostty-smoke", "cargo run --locked --no-default-features --features ghostty --bin input-smoke", "cargo run --locked --no-default-features --features ghostty --bin pty-smoke", "cargo run --locked --no-default-features --features ghostty --bin server-smoke", "cargo run --locked --no-default-features --features ghostty --bin cli-smoke", "cargo run --locked --no-default-features --features ghostty --bin rex-native-smoke"]
 
 [tasks.lint]
 description = "Run Clippy across the application"

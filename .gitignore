@@ -1,2 +1,6 @@
 /target/
 /mise.local.toml
+
+# Local audit reports and evidence bundles
+/docs/audits/
+/docs/*audit*.md

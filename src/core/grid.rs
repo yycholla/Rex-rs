@@ -1,6 +1,7 @@
 use std::{fmt, num::NonZeroU16};
 
 /// A terminal's logical dimensions, independent of pixels and display scale.
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridSize {
     columns: NonZeroU16,
@@ -20,7 +21,6 @@ impl GridSize {
     }
 
     #[must_use]
-
     pub const fn columns(self) -> u16 {
         self.columns.get()
     }
@@ -45,6 +45,7 @@ impl Default for GridSize {
     }
 }
 
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InvalidGridSize;
 
@@ -56,10 +57,6 @@ impl fmt::Display for InvalidGridSize {
 impl std::error::Error for InvalidGridSize {}
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "Tests assert fixture preconditions and should fail immediately when those preconditions break."
-)]
 mod tests {
     use super::*;
 

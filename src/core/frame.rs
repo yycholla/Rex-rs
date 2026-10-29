@@ -1,6 +1,8 @@
 //! Owned rendering data. These values can cross threads; Ghostty handles cannot.
 use super::GridSize;
+use std::sync::Arc;
 
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rgb {
     pub r: u8,
@@ -23,6 +25,7 @@ impl Rgb {
     }
 }
 
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CellWidth {
     #[default]
@@ -32,6 +35,20 @@ pub enum CellWidth {
     WrapSpacer,
 }
 
+/// Native underline forms, retained independently from the legacy enabled flag.
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnderlineKind {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -41,6 +58,10 @@ pub struct CellStyle {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    #[cfg_attr(feature = "ghostty", serde(default))]
+    pub underline_kind: UnderlineKind,
+    #[cfg_attr(feature = "ghostty", serde(default))]
+    pub underline_color: Option<Rgb>,
     pub inverse: bool,
     pub invisible: bool,
     pub faint: bool,
@@ -49,6 +70,21 @@ pub struct CellStyle {
     pub overline: bool,
 }
 
+impl CellStyle {
+    /// Old frames with only the enabled flag retain a single underline.
+    #[must_use]
+    pub const fn resolved_underline(self) -> UnderlineKind {
+        if !self.underline {
+            return UnderlineKind::None;
+        }
+        match self.underline_kind {
+            UnderlineKind::None => UnderlineKind::Single,
+            kind => kind,
+        }
+    }
+}
+
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cell {
     /// Full grapheme cluster, not an assumed one-byte character.
@@ -59,13 +95,33 @@ pub struct Cell {
     pub style: CellStyle,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorStyle {
+    #[default]
+    Block,
+    Bar,
+    Underline,
+    BlockHollow,
+}
+
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
     pub column: u16,
     pub row: u16,
+    #[cfg_attr(feature = "ghostty", serde(default))]
+    pub style: CursorStyle,
+    #[cfg_attr(feature = "ghostty", serde(default))]
+    pub color: Option<Rgb>,
+    #[cfg_attr(feature = "ghostty", serde(default))]
+    pub blinking: bool,
+    #[cfg_attr(feature = "ghostty", serde(default))]
+    pub wide_tail: bool,
 }
 
 /// Consecutive cells sharing a style, suitable for batched text shaping.
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellRun {
     pub column: usize,
@@ -76,11 +132,15 @@ pub struct CellRun {
     pub style: CellStyle,
 }
 
+/// Immutable terminal row shared across frames when its cells have not changed.
+pub type TerminalRow = Arc<Vec<Cell>>;
+
+#[cfg_attr(feature = "ghostty", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalFrame {
     pub size: GridSize,
     /// One vector entry per physical column, including wide-character spacers.
-    pub rows: Vec<Vec<Cell>>,
+    pub rows: Vec<TerminalRow>,
     pub cursor: Option<Cursor>,
     pub foreground: Rgb,
     pub background: Rgb,
@@ -135,7 +195,7 @@ impl TerminalFrame {
             .iter()
             .map(|row| {
                 let mut line = String::new();
-                for cell in row {
+                for cell in row.iter() {
                     if cell.width == CellWidth::Continuation {
                         continue;
                     }
@@ -162,7 +222,7 @@ mod tests {
     fn diagnostic_text_preserves_graphemes_without_duplicating_wide_cells() {
         let frame = TerminalFrame {
             size: GridSize::new(5, 1).unwrap(),
-            rows: vec![vec![
+            rows: vec![Arc::new(vec![
                 Cell {
                     text: "界".into(),
                     width: CellWidth::Wide,
@@ -178,7 +238,7 @@ mod tests {
                 },
                 Cell::default(),
                 Cell::default(),
-            ]],
+            ])],
             cursor: None,
             foreground: Rgb::default(),
             background: Rgb::default(),
@@ -188,5 +248,38 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].columns, 5);
         assert_eq!(runs[0].text, "界e\u{301}  ");
+    }
+    #[test]
+    fn legacy_enabled_underline_defaults_single_but_disabled_stays_off() {
+        let mut style = CellStyle {
+            underline: true,
+            ..CellStyle::default()
+        };
+        assert_eq!(style.resolved_underline(), UnderlineKind::Single);
+        style.underline_kind = UnderlineKind::Curly;
+        assert_eq!(style.resolved_underline(), UnderlineKind::Curly);
+        style.underline = false;
+        assert_eq!(style.resolved_underline(), UnderlineKind::None);
+    }
+
+    #[cfg(feature = "ghostty")]
+    #[test]
+    fn legacy_cursor_and_styles_decode_with_presentation_defaults() -> Result<(), serde_json::Error>
+    {
+        let cursor: Cursor = serde_json::from_str(r#"{"column":1,"row":2}"#)?;
+        assert_eq!(
+            cursor,
+            Cursor {
+                column: 1,
+                row: 2,
+                ..Cursor::default()
+            }
+        );
+        let style: CellStyle = serde_json::from_str(
+            r#"{"bold":false,"italic":false,"underline":true,"inverse":false,"invisible":false,"faint":false,"blink":false,"strikethrough":false,"overline":false}"#,
+        )?;
+        assert_eq!(style.resolved_underline(), UnderlineKind::Single);
+        assert_eq!(style.underline_color, None);
+        Ok(())
     }
 }

@@ -6,3 +6,9 @@ pub mod terminal;
 
 #[cfg(feature = "desktop")]
 pub mod ui;
+
+#[cfg(feature = "ghostty")]
+pub mod server;
+
+#[cfg(feature = "ghostty")]
+pub mod rex;

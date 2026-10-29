@@ -50,7 +50,8 @@ fn check_workspace_lifetimes() -> Result<()> {
         .state()
         .active_session()
         .context("new workspace must have an active session")?
-        .active_pane();
+        .active_pane()
+        .context("fixture session must have an attached pane")?;
     workspace.feed(first, b"retained contents")?;
     let retained = Arc::clone(
         workspace
@@ -65,7 +66,8 @@ fn check_workspace_lifetimes() -> Result<()> {
         .state()
         .active_session()
         .context("splitting must preserve the active session")?
-        .active_pane();
+        .active_pane()
+        .context("fixture session must have an attached pane")?;
     ensure!(
         Arc::ptr_eq(
             &retained,

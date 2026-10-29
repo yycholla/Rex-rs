@@ -1,0 +1,4 @@
+[env]
+# Native Debug performs expensive terminal-history validation on every write.
+# Keep Rust debuginfo and optimized Ghostty runtime safety checks in development.
+LIBGHOSTTY_VT_SYS_OPTIMIZE = { value = "ReleaseSafe", force = false }
