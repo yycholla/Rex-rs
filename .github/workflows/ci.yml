@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      native_rex:
+        description: Run full verification on the provisioned Rex runner (main only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  linux:
+    name: Linux build, lint and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: bash scripts/ci-dependencies.sh
+      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5
+      - name: Ensure Rust checks are available
+        run: mise exec -- rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: linux-${{ hashFiles('mise.toml', '.cargo/config.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Formatting and compilation
+        run: mise run check
+      - name: Strict Clippy
+        run: mise run lint
+      - name: Pure core tests
+        run: mise run test:core
+      - name: Unit tests
+        run: mise exec -- cargo test --locked --all-targets
+      - name: Headless Ghostty, input, PTY and local server checks
+        run: mise exec -- bash scripts/ci-smoke.sh
+      - name: Explain native interoperability coverage
+        run: |
+          echo 'Native Rex interoperability is separate: dispatch CI with native_rex=true on main using a provisioned runner labeled rex.' >> "$GITHUB_STEP_SUMMARY"
+
+  linux-release:
+    name: Linux release binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: bash scripts/ci-dependencies.sh
+      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: linux-release-${{ hashFiles('mise.toml', '.cargo/config.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build release binary
+        run: mise exec -- cargo build --locked --release --bin rex-rs
+      - name: Package
+        run: |
+          name="rex-rs-${GITHUB_SHA::12}-linux-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/rex-rs README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "ARCHIVE=dist/$name.tar.gz" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rex-rs-linux-x86_64
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 14
+
+  native-rex:
+    name: Native Rex interoperability (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.native_rex && github.ref == 'refs/heads/main'
+    needs: linux
+    runs-on: [self-hosted, linux, x64, rex]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Require preinstalled official Rex
+        run: command -v rex
+      - uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5
+      - name: Ensure Rust checks are available
+        run: mise exec -- rustup component add rustfmt clippy
+      - name: Full integration gate with isolated Rex server
+        run: mise run verify
