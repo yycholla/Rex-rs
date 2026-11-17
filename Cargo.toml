@@ -138,3 +138,8 @@ gpui = { path = "vendor/gpui" }
 # Backport snapshot image records and static PNG decoding; retain the wrapper pin.
 [patch."https://github.com/Uzaaft/libghostty-rs"]
 libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
+
+[[bin]]
+name = "rex-web-bridge"
+path = "src/bin/rex-web-bridge.rs"
+required-features = ["ghostty"]
