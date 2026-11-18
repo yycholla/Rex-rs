@@ -58,7 +58,7 @@ Snapshot result:
 
 ```
 {connected,generation,revision,serverId,activeSessionId,
- sessions:[{id,title,activeWindowId,windows:[{id,title,activeBlockId,
+ sessions:[{id,title,activeWindowId,windows:[{id,title,activeBlockId,zoomedBlockId,visibleBlockIds,
    layers:[{id,kind,bounds:[x,y,width,height],layout}]}]}],
  blocks:[{id,sessionId,title,owner,terminal,detached,status,inputAvailable,ownsSize}],
  frames:{[blockId]:{cols,rows,lines,cursor,foreground,background,imagesOmitted}},
@@ -96,3 +96,11 @@ The smoke runner starts a disposable installed Rex server with its own temporary
 socket/config/state, creates only fixture sessions, verifies colored decoded
 output, splits/tabs, reconnect/stale generation, detach/restore and cleanup.
 It never connects to a user's default Rex server.
+
+Window visibility is authoritative: `zoomedBlockId` is null when unzoomed;
+`visibleBlockIds` contains the zoom target alone or all placed blocks, including
+floating and unsupported content. Layers retain the complete layout so unzoom
+can restore it. Consumers must honor visibility instead of rendering every layer.
+`frames` exports only terminal blocks visible in the active session's active
+window, never cached siblings hidden by zoom or cached frames from inactive tabs.
+A visible block may have no frame while its native stream is loading.

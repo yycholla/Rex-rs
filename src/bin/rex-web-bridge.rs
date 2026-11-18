@@ -8,7 +8,7 @@ use rex_rs::{
     rex::{
         WorkspaceClient,
         automation::ActionError,
-        workspace::{ViewLayout, WorkspaceState},
+        workspace::{ViewLayout, WindowView, WorkspaceState},
     },
 };
 use serde::Deserialize;
@@ -131,6 +131,35 @@ fn layout(state: &WorkspaceState, node: &ViewLayout) -> Value {
         }
     }
 }
+fn window_visible_panes(window: &WindowView) -> Vec<PaneId> {
+    window
+        .zoomed_pane()
+        .map_or_else(|| window.placed_panes(), |pane| vec![pane])
+}
+fn visible_frame_panes(state: &WorkspaceState) -> HashSet<PaneId> {
+    state
+        .active_session()
+        .and_then(rex_rs::rex::workspace::SessionView::active_window)
+        .map(window_visible_panes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pane| {
+            state
+                .pane(*pane)
+                .is_some_and(rex_rs::rex::workspace::BlockView::is_terminal)
+                && !state.is_detached(*pane)
+        })
+        .collect()
+}
+fn window_snapshot(state: &WorkspaceState, window: &WindowView) -> Value {
+    json!({
+        "id":window.remote_id(), "title":window.title(),
+        "activeBlockId":window.active_pane().and_then(|p|remote(state,p)),
+        "zoomedBlockId":window.zoomed_pane().and_then(|p|remote(state,p)),
+        "visibleBlockIds":window_visible_panes(window).into_iter().filter_map(|p|remote(state,p)).collect::<Vec<_>>(),
+        "layers":window.layers.iter().map(|layer|json!({"id":layer.remote_id,"kind":layer.kind,"bounds":layer.bounds,"layout":layer.layout.as_ref().map(|node|layout(state,node))})).collect::<Vec<_>>()
+    })
+}
 struct Bridge {
     client: WorkspaceClient,
     incarnation: String,
@@ -161,11 +190,16 @@ impl Bridge {
     }
     fn snapshot(&self) -> Value {
         let state = self.client.state();
-        let sessions: Vec<_> = state.sessions().iter().map(|s| json!({"id":s.remote_id(),"title":s.title(),"activeWindowId":s.active_window().map(rex_rs::rex::workspace::WindowView::remote_id),"windows":s.windows().iter().map(|w|json!({"id":w.remote_id(),"title":w.title(),"activeBlockId":w.active_pane().and_then(|p|remote(state,p)),"layers":w.layers.iter().map(|l|json!({"id":l.remote_id,"kind":l.kind,"bounds":l.bounds,"layout":l.layout.as_ref().map(|n|layout(state,n))})).collect::<Vec<_>>()})).collect::<Vec<_>>() })).collect();
+        let visible = visible_frame_panes(state);
+        let sessions: Vec<_> = state.sessions().iter().map(|session|json!({
+            "id":session.remote_id(),"title":session.title(),
+            "activeWindowId":session.active_window().map(WindowView::remote_id),
+            "windows":session.windows().iter().map(|window|window_snapshot(state,window)).collect::<Vec<_>>()
+        })).collect();
         let mut frames = serde_json::Map::new();
         let blocks: Vec<_> = state.pane_ids().into_iter().filter_map(|p| {
             let b = state.pane(p)?;
-            if let Some(f) = self.client.frame(p) {
+            if visible.contains(&p) && let Some(f) = self.client.frame(p) {
                 frames.insert(b.remote_id.clone(),json!({"cols":f.size.columns(),"rows":f.size.rows(),"lines":(0..f.rows.len()).map(|r|f.row_runs(r)).collect::<Vec<_>>(),"cursor":f.cursor,"foreground":f.foreground,"background":f.background,"imagesOmitted":!f.images.is_empty()}));
             }
             Some(json!({"id":b.remote_id,"sessionId":b.session_id,"title":b.title(),"owner":b.owner,"terminal":b.is_terminal(),"detached":state.is_detached(p),"status":self.client.status(p).map(|s|format!("{s:?}")),"inputAvailable":self.client.input_available(p),"ownsSize":self.client.owns_size(p)}))
@@ -259,10 +293,7 @@ impl Bridge {
     }
     fn handle(&mut self, r: &Request) -> Result<Value> {
         if r.op == "snapshot" {
-            let cells: usize = self
-                .client
-                .state()
-                .pane_ids()
+            let cells: usize = visible_frame_panes(self.client.state())
                 .into_iter()
                 .filter_map(|p| self.client.frame(p))
                 .map(|f| usize::from(f.size.columns()) * usize::from(f.size.rows()))
@@ -473,6 +504,75 @@ mod tests {
         assert!(Request::parse(br#"{"id":"1","op":"snapshot","endpoint":"bad"}"#).is_err());
         assert!(Request::parse(&vec![b' '; MAX_LINE + 1]).is_err());
         assert!(Request::parse(br#"{"id":"1","op":"snapshot"}"#).is_ok());
+    }
+    #[test]
+    fn snapshot_visibility_tracks_zoom_unzoom_and_tab_selection() -> Result<()> {
+        let layer = |id: &str, kind: &str, creator: &str| {
+            json!({
+                "layer_id":format!("layer:{id}"),"kind":kind,"bounds":[0,0,1,1],
+                "layout":{"block_id":id,"rect":[0,0,1,1]},
+                "blocks":[{"block_id":id,"creator_name":creator}]
+            })
+        };
+        let mut view = json!({"session_id":"session:a","revision":1,"active_window_id":"window:a","windows":[
+            {"window_id":"window:a","focused_block_id":"block:a","layers":[
+                layer("block:a","tiled","com.superlogical.terminal"),
+                layer("block:b","floating","com.superlogical.terminal"),
+                layer("block:custom","floating","custom.creator")
+            ]},
+            {"window_id":"window:b","focused_block_id":"block:c","layers":[layer("block:c","tiled","com.superlogical.terminal")]}
+        ]});
+        let mut state = WorkspaceState::default();
+        let remote_frames = |state: &WorkspaceState| -> HashSet<String> {
+            visible_frame_panes(state)
+                .into_iter()
+                .filter_map(|p| remote(state, p).map(str::to_owned))
+                .collect()
+        };
+        state.apply_view(&view)?;
+        assert_eq!(
+            remote_frames(&state),
+            HashSet::from(["block:a".into(), "block:b".into()])
+        );
+        let projected = window_snapshot(
+            &state,
+            state
+                .active_session()
+                .context("session")?
+                .active_window()
+                .context("window")?,
+        );
+        assert_eq!(projected["zoomedBlockId"], Value::Null);
+        assert_eq!(
+            projected["visibleBlockIds"],
+            json!(["block:a", "block:b", "block:custom"])
+        );
+        view["revision"] = json!(2);
+        view["windows"][0]["zoomed_block_id"] = json!("block:b");
+        state.apply_view(&view)?;
+        let projected = window_snapshot(
+            &state,
+            state
+                .active_session()
+                .context("session")?
+                .active_window()
+                .context("window")?,
+        );
+        assert_eq!(projected["zoomedBlockId"], "block:b");
+        assert_eq!(projected["visibleBlockIds"], json!(["block:b"]));
+        assert_eq!(remote_frames(&state), HashSet::from(["block:b".into()]));
+        view["revision"] = json!(3);
+        view["windows"][0]["zoomed_block_id"] = Value::Null;
+        state.apply_view(&view)?;
+        assert_eq!(
+            remote_frames(&state),
+            HashSet::from(["block:a".into(), "block:b".into()])
+        );
+        view["revision"] = json!(4);
+        view["active_window_id"] = json!("window:b");
+        state.apply_view(&view)?;
+        assert_eq!(remote_frames(&state), HashSet::from(["block:c".into()]));
+        Ok(())
     }
     #[test]
     fn key_names_are_native_not_escape_sequences() {

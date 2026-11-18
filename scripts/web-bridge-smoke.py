@@ -66,8 +66,25 @@ with tempfile.TemporaryDirectory(prefix='rex-web-bridge-smoke-') as directory:
         wait(lambda s:any('SINGLE_INPUT_OK' in ''.join(run['text'] for run in row) for row in s['frames'][bid]['lines']))
         assert command('split-right',blockId=bid)['ack']=='applied'
         s=wait(lambda s:len(s['blocks'])>=2)
+        def fixture_api(method, **args):
+            result=subprocess.run(['rex','--autostart=false','--server',endpoint,'api','call',method,json.dumps(args)],env=env,check=True,capture_output=True,text=True,timeout=10)
+            return json.loads(result.stdout)
+        s=wait(lambda s:len(s['frames'])==2)
+        siblings=set(s['frames'])-{bid}
+        fixture_api('session.zoom_block',session_id=sid,block_id=bid)
+        native=fixture_api('session.view',session_id=sid)
+        assert native['windows'][0]['zoomed_block_id']==bid
+        s=wait(lambda s:s['sessions'][0]['windows'][0].get('zoomedBlockId')==bid)
+        zoomed=s['sessions'][0]['windows'][0]
+        assert zoomed['visibleBlockIds']==[bid]
+        assert not (siblings & set(s['frames'])), 'zoom leaked cached sibling frames'
+        assert bid in s['frames']
+        fixture_api('session.zoom_block',session_id=sid,block_id=bid)
+        s=wait(lambda s:s['sessions'][0]['windows'][0].get('zoomedBlockId') is None and set(s['frames'])==siblings|{bid})
+        assert set(s['sessions'][0]['windows'][0]['visibleBlockIds'])==siblings|{bid}
         assert command('new-window',sessionId=sid,title='Second tab')['ack']=='applied'
-        s=wait(lambda s:len(s['sessions'][0]['windows'])==2)
+        s=wait(lambda s:len(s['sessions'][0]['windows'])==2 and len(s['frames'])==1)
+        assert not (set(s['frames']) & (siblings|{bid})), 'inactive tab leaked cached frames'
         generation=s['generation']
         original_owners={b['id']:b['owner'] for b in s['blocks']}
         bridge.stdin.close(); bridge.wait(timeout=5)
@@ -86,7 +103,7 @@ with tempfile.TemporaryDirectory(prefix='rex-web-bridge-smoke-') as directory:
         wait(lambda s:any(b['id']==bid and not b['detached'] for b in s['blocks']))
         assert command('close-session',sessionId=sid)['ack']=='applied'
         wait(lambda s:not s['sessions'])
-        print('PASS native bridge: empty attach, validation, authoritative create, input, decoded color frame, split, tab, reconnect, stale generation, select, detach, restore, close')
+        print('PASS native bridge: empty attach, validation, authoritative create, input, decoded color frame, split, zoom/unzoom, tab visibility, reconnect, stale generation, select, detach, restore, close')
     except Exception:
         log.flush(); log.seek(0); print(log.read()[-18000:],file=sys.stderr)
         raise
