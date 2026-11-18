@@ -2,10 +2,10 @@ use gpui::{
     App, AppContext, Application, Bounds, Focusable, TitlebarOptions, WindowBounds, WindowOptions,
     px, size,
 };
-use rex_rs::ui::{WorkspaceView, actions};
+use rex_rs::ui::{Assets, WorkspaceView, actions};
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(Assets).run(|cx: &mut App| {
         actions::register(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {

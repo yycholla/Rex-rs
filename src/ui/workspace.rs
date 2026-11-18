@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable, Render,
-    SharedString, Stateful, Subscription, Task, Window, div, prelude::*, px, rgb,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
+    FontWeight, MouseButton, Render, SharedString, Subscription, Task, Window, div, prelude::*, px,
+    rgb,
 };
 
 use super::{
@@ -13,7 +14,8 @@ use super::{
     },
     components::text_field::{TextField, TextFieldEvent},
     components::{
-        ButtonVariant, button, empty_state, pane_header, section_label, session_item, status_bar,
+        ButtonVariant, Icon, add_row, button, empty_state, icon_button, pane_header, session_row,
+        sidebar_footer, sidebar_heading, tab_row,
     },
     terminal_view::{TerminalView, TerminalViewEvent},
     theme::Theme,
@@ -362,27 +364,34 @@ impl WorkspaceView {
     }
     fn rename_dialog(&self, dialog: &RenameDialog, cx: &Context<Self>) -> Div {
         let theme = self.theme;
+        let colors = theme.colors;
         let title = match dialog.target {
-            RenameTarget::Session(_) => "Rename session",
-            RenameTarget::Window(_) => "Rename tab",
+            RenameTarget::Session(_) => "Rename Session",
+            RenameTarget::Window(_) => "Rename Tab",
         };
         let mut panel = div()
             .flex()
             .flex_col()
-            .w(px(420.))
+            .w(px(360.))
             .p_4()
-            .gap_4()
-            .rounded_lg()
-            .bg(rgb(theme.colors.surface))
+            .gap_3()
+            .rounded(px(12.))
+            .bg(rgb(colors.raised))
             .border_1()
-            .border_color(rgb(theme.colors.border))
-            .child(div().text_lg().child(title))
+            .border_color(rgb(colors.border_strong))
+            .shadow_lg()
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
             .child(dialog.input.clone());
         if let Some(error) = &self.last_error {
             panel = panel.child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(theme.colors.danger))
+                    .text_size(px(12.))
+                    .text_color(rgb(colors.danger))
                     .child(error.clone()),
             );
         }
@@ -397,7 +406,7 @@ impl WorkspaceView {
                     ),
                 )
                 .child(
-                    button("save-rename", "Save", ButtonVariant::Primary, theme).on_click(
+                    button("save-rename", "Rename", ButtonVariant::Primary, theme).on_click(
                         cx.listener(|view, _, window, cx| view.commit_rename(window, cx)),
                     ),
                 ),
@@ -409,238 +418,255 @@ impl WorkspaceView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::rgba(0x0000_0080))
+            .bg(gpui::rgba(0x0000_0066))
             .child(panel)
     }
 
+    /// Sessions grouped under their host, each listing its tabs vertically.
     fn sidebar(&self, cx: &Context<Self>) -> Div {
         let theme = self.theme;
-        let active = self.runtime.state().active_session().map(Session::id);
-        let sessions = self.runtime.state().sessions().iter().map(|session| {
+        let state = self.runtime.state();
+        let active = state.active_session().map(Session::id);
+        let mut list = div()
+            .id("session-list")
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .flex_1()
+            .min_h_0()
+            .px_2()
+            .overflow_y_scroll()
+            .child(sidebar_heading("Local", theme));
+        for session in state.sessions() {
             let id = session.id();
-            session_item(session, active == Some(id), theme).on_click(cx.listener(
-                move |view, _, window, cx| {
-                    view.dispatch(Command::SelectSession(id), window, cx);
-                },
-            ))
-        });
+            let is_active = active == Some(id);
+            list = list.child(
+                session_row(
+                    SharedString::from(format!("session-{id}")),
+                    session.title().to_owned(),
+                    is_active,
+                    theme,
+                )
+                .on_click(cx.listener(
+                    move |view, event: &ClickEvent, window, cx| {
+                        view.dispatch(Command::SelectSession(id), window, cx);
+                        if event.click_count() > 1 {
+                            view.rename_session(&RenameSession, window, cx);
+                        }
+                    },
+                )),
+            );
+            let selected_window = session.active_window().id();
+            for tab in session.windows() {
+                let tab_id = tab.id();
+                list = list.child(
+                    tab_row(
+                        SharedString::from(format!("window-{tab_id}")),
+                        tab.title().to_owned(),
+                        is_active && tab_id == selected_window,
+                        tab.layout().panes().len(),
+                        theme,
+                    )
+                    .on_click(cx.listener(
+                        move |view, event: &ClickEvent, window, cx| {
+                            view.dispatch(Command::SelectWindow(tab_id), window, cx);
+                            if event.click_count() > 1 {
+                                view.rename_window(&RenameWindow, window, cx);
+                            }
+                        },
+                    )),
+                );
+            }
+            if is_active {
+                list = list.child(
+                    add_row(
+                        SharedString::from(format!("new-window-{id}")),
+                        "New Tab",
+                        true,
+                        theme,
+                    )
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.new_window(&NewWindow, window, cx);
+                    })),
+                );
+            }
+        }
+        list = list.child(
+            add_row("new-session-row", "New Session", false, theme).on_click(
+                cx.listener(|view, _, window, cx| view.new_session(&NewSession, window, cx)),
+            ),
+        );
+        let message = self
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "Local shells running".into());
         div()
             .flex()
             .flex_col()
             .w(px(theme.sidebar_width))
             .h_full()
             .flex_shrink_0()
-            .p_4()
-            .gap_4()
             .bg(rgb(theme.colors.sidebar))
             .border_r_1()
             .border_color(rgb(theme.colors.border))
-            .child(div().text_xl().child("Rex-rs"))
-            .child(section_label("LOCAL SESSIONS", theme))
-            .child(
-                div()
-                    .id("session-list")
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(sessions),
-            )
-            .child(
-                button(
-                    "new-session",
-                    "+ New session",
-                    ButtonVariant::Primary,
-                    theme,
-                )
-                .on_click(
-                    cx.listener(|view, _, window, cx| view.new_session(&NewSession, window, cx)),
-                ),
-            )
-            .child(section_label("Ctrl+Shift+N · New session", theme))
+            .child(self.sidebar_titlebar(cx))
+            .child(list)
+            .child(sidebar_footer(
+                SharedString::from(message),
+                self.last_error.is_some(),
+                theme,
+            ))
     }
 
-    fn toolbar(&self, cx: &Context<Self>) -> Div {
+    /// Draggable strip above the session list, where Rex places window controls.
+    fn sidebar_titlebar(&self, cx: &Context<Self>) -> Div {
         let theme = self.theme;
-        let active = self.runtime.state().active_session();
-        let mut toolbar = div()
+        div()
             .flex()
             .items_center()
             .justify_between()
-            .p_3()
-            .gap_3()
+            .h(px(40.))
+            .pl_3()
+            .pr_2()
             .flex_shrink_0()
-            .border_b_1()
-            .border_color(rgb(theme.colors.border))
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
             .child(
                 div()
-                    .text_sm()
-                    .child(active.map_or("Workspace", Session::title).to_owned()),
-            );
-        if active.is_some() {
-            toolbar =
-                toolbar.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            button(
-                                "rename-session",
-                                "Rename session",
-                                ButtonVariant::Quiet,
-                                theme,
-                            )
-                            .on_click(cx.listener(
-                                |view, _, window, cx| {
-                                    view.rename_session(&RenameSession, window, cx);
-                                },
-                            )),
-                        )
-                        .child(
-                            button("rename-tab", "Rename tab", ButtonVariant::Quiet, theme)
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.rename_window(&RenameWindow, window, cx);
-                                })),
-                        )
-                        .child(
-                            button("split-right", "Split right", ButtonVariant::Quiet, theme)
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.split_right(&SplitRight, window, cx);
-                                })),
-                        )
-                        .child(
-                            button("split-down", "Split down", ButtonVariant::Quiet, theme)
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.split_down(&SplitDown, window, cx);
-                                })),
-                        )
-                        .child(
-                            button(
-                                "zoom",
-                                if self.zoomed.is_some() {
-                                    "Unzoom"
-                                } else {
-                                    "Zoom"
-                                },
-                                ButtonVariant::Quiet,
-                                theme,
-                            )
-                            .on_click(cx.listener(
-                                |view, _, window, cx| view.toggle_zoom(&ToggleZoom, window, cx),
-                            )),
-                        )
-                        .child(
-                            button("close-pane", "Close pane", ButtonVariant::Quiet, theme)
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.close_pane(&ClosePane, window, cx);
-                                })),
-                        ),
-                );
-        }
-        toolbar
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(theme.colors.muted))
+                    .child("Rex"),
+            )
+            .child(icon_button("new-session", Icon::Plus, theme).on_click(
+                cx.listener(|view, _, window, cx| view.new_session(&NewSession, window, cx)),
+            ))
     }
 
-    fn tabs(&self, cx: &Context<Self>) -> Stateful<Div> {
+    fn pane(&self, pane: PaneId, focused: bool, multiple: bool, cx: &Context<Self>) -> AnyElement {
         let theme = self.theme;
-        let mut tabs = div()
-            .id("window-tabs")
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .flex_shrink_0()
-            .overflow_x_scroll()
-            .border_b_1()
-            .border_color(rgb(theme.colors.border));
-        if let Some(session) = self.runtime.state().active_session() {
-            for window in session.windows() {
-                let id = window.id();
-                let selected = id == session.active_window().id();
-                tabs = tabs.child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .child(
-                            button(
-                                SharedString::from(format!("window-{id}")),
-                                SharedString::from(window.title().to_owned()),
-                                if selected {
-                                    ButtonVariant::Selected
-                                } else {
-                                    ButtonVariant::Quiet
-                                },
-                                theme,
-                            )
-                            .on_click(cx.listener(
-                                move |view, _, window, cx| {
-                                    view.dispatch(Command::SelectWindow(id), window, cx);
-                                },
-                            )),
-                        )
-                        .child(
-                            button(
-                                SharedString::from(format!("close-window-{id}")),
-                                "×",
-                                ButtonVariant::Quiet,
-                                theme,
-                            )
-                            .on_click(cx.listener(
-                                move |view, _, window, cx| {
-                                    view.dispatch(Command::CloseWindow(id), window, cx);
-                                },
-                            )),
-                        ),
-                );
-            }
-            tabs = tabs.child(
-                button("new-window", "+", ButtonVariant::Primary, theme).on_click(
-                    cx.listener(|view, _, window, cx| view.new_window(&NewWindow, window, cx)),
-                ),
-            );
-        }
-        tabs
-    }
-
-    fn pane(&self, pane: PaneId, focused: bool) -> AnyElement {
-        let theme = self.theme;
-        let status = match self.runtime.status(pane) {
-            Some(PaneStatus::Running) => "RUNNING".to_owned(),
-            Some(PaneStatus::Exited { code }) => format!("EXITED {code}"),
-            Some(PaneStatus::Failed { message }) => format!("ERROR: {message}"),
-            None => "TERMINAL".to_owned(),
+        let colors = theme.colors;
+        let (status_color, status) = match self.runtime.status(pane) {
+            Some(PaneStatus::Running) => (colors.success, None),
+            Some(PaneStatus::Exited { code }) => (colors.faint, Some(format!("exited {code}"))),
+            Some(PaneStatus::Failed { message }) => (colors.danger, Some(message.clone())),
+            None => (colors.faint, None),
         };
-        let mut body = div()
+        let zoomed = self.zoomed == Some(pane);
+        let header = pane_header(
+            SharedString::from(format!("Terminal {pane}")),
+            status_color,
+            focused,
+            theme,
+        )
+        .when_some(status, |header, status| {
+            header.child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(colors.faint))
+                    .child(status),
+            )
+        });
+        let header = self.pane_controls(header, pane, zoomed, multiple, cx);
+        let mut content = div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .p(px(4.))
+            .bg(rgb(colors.terminal))
+            .when(!focused, |content| {
+                content.opacity(theme.inactive_pane_opacity)
+            });
+        if let Some(entry) = self.panes.get(&pane) {
+            content = content.child(entry.view.clone());
+        }
+        div()
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .size_full()
-            .border_1()
-            .border_color(rgb(if focused {
-                theme.colors.accent
-            } else {
-                theme.colors.border
-            }))
-            .child(pane_header(
-                SharedString::from(format!("Terminal {pane}")),
-                SharedString::from(status),
-                focused,
-                theme,
-            ));
-        if let Some(entry) = self.panes.get(&pane) {
-            body = body.child(entry.view.clone());
-        }
-        body.into_any_element()
+            .bg(rgb(colors.surface))
+            .child(header)
+            .child(content)
+            .when(focused && multiple, |body| {
+                body.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .border_1()
+                        .border_color(rgb(colors.accent)),
+                )
+            })
+            .into_any_element()
     }
 
-    fn layout(&self, layout: &Layout, focused: PaneId) -> AnyElement {
+    /// Trailing pane-header controls. They act on their own pane, not the focused one.
+    fn pane_controls(
+        &self,
+        header: Div,
+        pane: PaneId,
+        zoomed: bool,
+        multiple: bool,
+        cx: &Context<Self>,
+    ) -> Div {
+        let theme = self.theme;
+        let split = |axis: SplitAxis, glyph: Icon, name: &str| {
+            icon_button(SharedString::from(format!("{name}-{pane}")), glyph, theme).on_click(
+                cx.listener(move |view, _, window, cx| {
+                    view.dispatch(Command::SplitPane { pane, axis }, window, cx);
+                }),
+            )
+        };
+        header
+            .child(split(
+                SplitAxis::Horizontal,
+                Icon::SplitRight,
+                "split-right",
+            ))
+            .child(split(SplitAxis::Vertical, Icon::SplitDown, "split-down"))
+            .when(multiple || zoomed, |header| {
+                header.child(
+                    icon_button(
+                        SharedString::from(format!("zoom-{pane}")),
+                        if zoomed {
+                            Icon::Minimize
+                        } else {
+                            Icon::Maximize
+                        },
+                        theme,
+                    )
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.zoomed = if zoomed { None } else { Some(pane) };
+                        view.focus_active(window, cx);
+                        cx.notify();
+                    })),
+                )
+            })
+            .child(
+                icon_button(
+                    SharedString::from(format!("close-pane-{pane}")),
+                    Icon::Close,
+                    theme,
+                )
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    view.dispatch(Command::ClosePane(pane), window, cx);
+                })),
+            )
+    }
+
+    /// Compact panes sit flush; the 1px gaps reveal the divider color.
+    fn layout(
+        &self,
+        layout: &Layout,
+        focused: PaneId,
+        multiple: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         match layout {
-            Layout::Pane(pane) => self.pane(*pane, *pane == focused),
+            Layout::Pane(pane) => self.pane(*pane, *pane == focused, multiple, cx),
             Layout::Split {
                 axis,
                 first,
@@ -651,10 +677,11 @@ impl WorkspaceView {
                 .size_full()
                 .min_w_0()
                 .min_h_0()
-                .gap_2()
+                .gap(px(1.))
+                .bg(rgb(self.theme.colors.border))
                 .when(*axis == SplitAxis::Vertical, gpui::Styled::flex_col)
-                .child(self.layout(first, focused))
-                .child(self.layout(second, focused))
+                .child(self.layout(first, focused, multiple, cx))
+                .child(self.layout(second, focused, multiple, cx))
                 .into_any_element(),
         }
     }
@@ -672,15 +699,27 @@ impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let content = match self.runtime.state().active_session() {
-            Some(session) => self.zoomed.map_or_else(
-                || self.layout(session.layout(), session.active_pane()),
-                |pane| self.pane(pane, true),
-            ),
-            None => empty_state(theme).into_any_element(),
+            Some(session) => {
+                let multiple = session.layout().panes().len() > 1;
+                self.zoomed.map_or_else(
+                    || self.layout(session.layout(), session.active_pane(), multiple, cx),
+                    |pane| self.pane(pane, true, false, cx),
+                )
+            }
+            None => empty_state(theme)
+                .child(
+                    button(
+                        "empty-new-session",
+                        "New Session",
+                        ButtonVariant::Primary,
+                        theme,
+                    )
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.new_session(&NewSession, window, cx);
+                    })),
+                )
+                .into_any_element(),
         };
-        let message = self.last_error.clone().unwrap_or_else(|| {
-            "Local shells · Ctrl+Shift+T: new tab · Ctrl+Shift+C/V: copy/paste · Ctrl+Shift+Z: zoom".into()
-        });
         let mut root = div()
             .id("workspace")
             .relative()
@@ -688,6 +727,7 @@ impl Render for WorkspaceView {
             .size_full()
             .bg(rgb(theme.colors.background))
             .text_color(rgb(theme.colors.text))
+            .text_size(px(13.))
             .track_focus(&self.focus)
             .key_context(if self.rename.is_some() {
                 "WorkspaceModal"
@@ -714,18 +754,11 @@ impl Render for WorkspaceView {
             .child(
                 div()
                     .flex()
-                    .flex_col()
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .child(self.toolbar(cx))
-                    .child(self.tabs(cx))
-                    .child(div().flex().flex_1().min_h_0().p_3().child(content))
-                    .child(status_bar(
-                        SharedString::from(message),
-                        self.last_error.is_some(),
-                        theme,
-                    )),
+                    .bg(rgb(theme.colors.terminal))
+                    .child(content),
             );
         if let Some(dialog) = &self.rename {
             root = root.child(self.rename_dialog(dialog, cx));

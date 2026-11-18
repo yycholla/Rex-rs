@@ -286,8 +286,8 @@ impl TerminalView {
                     .top(px(f32::from(row) * metrics.cell_height))
                     .w(px(f32::from(last - first + 1) * metrics.cell_width))
                     .h(px(metrics.cell_height))
-                    .bg(rgb(self.theme.colors.selected))
-                    .opacity(0.45)
+                    .bg(rgb(self.theme.colors.accent))
+                    .opacity(0.35)
             })
             .collect()
     }
